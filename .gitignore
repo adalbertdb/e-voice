@@ -1,0 +1,6 @@
+target/
+.env
+state.toml
+openspec/
+.atl
+# Keep Cargo.lock for binaries/applications; omit for libraries if desired

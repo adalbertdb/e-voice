@@ -1,0 +1,19 @@
+pkgname=e-voice
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="LLM-powered voice dictation companion for Omarchy/Hyprland"
+arch=('x86_64')
+url="https://github.com/user/e-voice"
+license=('MIT')
+depends=('ollama' 'voxtype')
+makedepends=('rust' 'cargo')
+source=()
+
+build() {
+  cargo build --release
+}
+
+package() {
+  install -Dm755 target/release/e-voice "$pkgdir/usr/bin/e-voice"
+  install -Dm644 packaging/e-voice.service "$pkgdir/usr/lib/systemd/user/e-voice.service"
+}
