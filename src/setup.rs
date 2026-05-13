@@ -1,6 +1,6 @@
 //! First-run setup wizard for voxtype, Ollama, and Omarchy snippets.
 
-use crate::config::{config_dir, config_file_path, AppConfig};
+use crate::config::{AppConfig, config_dir, config_file_path};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,7 +23,6 @@ const HYPRLAND_SNIPPET: &str = r#"# e-voice / voxtype keybindings
 # Paste into ~/.config/hypr/bindings.conf
 bind = , F9, exec, voxtype record start
 bindr = , F9, exec, voxtype record stop
-bind = SUPER SHIFT, D, exec, e-voice menu | walker --dmenu
 "#;
 
 const WAYBAR_SNIPPET: &str = r#""custom/e-voice": {

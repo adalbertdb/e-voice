@@ -11,30 +11,12 @@ const DEFAULT_CONFIG_TOML: &str = include_str!("../config/default.toml");
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub ollama: OllamaConfig,
-    pub models: ModelsConfig,
-    pub mode: ModeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OllamaConfig {
     pub url: String,
     pub model: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ModelsConfig {
-    pub clean: String,
-    pub formal: String,
-    pub translate: String,
-    #[serde(default = "default_casual_model")]
-    pub casual: String,
-    #[serde(default = "default_bullet_model")]
-    pub bullet: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ModeConfig {
-    pub default: String,
 }
 
 impl Default for AppConfig {
@@ -58,35 +40,8 @@ impl AppConfig {
         Ok(toml::from_str(&content)?)
     }
 
-    pub fn model_for_mode(&self, mode: &Mode) -> &str {
-        match mode {
-            Mode::Clean => &self.models.clean,
-            Mode::Formal => &self.models.formal,
-            Mode::Casual => &self.models.casual,
-            Mode::Bullet => &self.models.bullet,
-            Mode::Translate(_) => &self.models.translate,
-        }
-    }
-
-    pub fn default_mode(&self) -> Mode {
-        self.mode.default.parse().unwrap_or(Mode::Clean)
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct StateFile {
-    pub mode: String,
-}
-
-impl StateFile {
-    pub fn from_mode(mode: &Mode) -> Self {
-        Self {
-            mode: mode.to_string(),
-        }
-    }
-
-    pub fn to_mode(&self) -> Mode {
-        self.mode.parse().unwrap_or(Mode::Clean)
+    pub fn model_for_mode(&self, _mode: &Mode) -> &str {
+        &self.ollama.model
     }
 }
 
@@ -117,41 +72,6 @@ pub fn config_file_path() -> Result<PathBuf, ConfigError> {
     Ok(config_dir()?.join("config.toml"))
 }
 
-pub fn state_file_path() -> Result<PathBuf, ConfigError> {
-    Ok(config_dir()?.join("state.toml"))
-}
-
-pub fn load_state(default_mode: &Mode) -> Result<Mode, ConfigError> {
-    let path = state_file_path()?;
-    if !path.exists() {
-        return Ok(default_mode.clone());
-    }
-
-    let content = fs::read_to_string(path)?;
-    let state: StateFile = toml::from_str(&content)?;
-    Ok(state.to_mode())
-}
-
-pub fn save_state(mode: &Mode) -> Result<(), ConfigError> {
-    let path = state_file_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let state = StateFile::from_mode(mode);
-    let body = toml::to_string(&state)?;
-    fs::write(path, body)?;
-    Ok(())
-}
-
-fn default_casual_model() -> String {
-    "llama3.2:1b".to_string()
-}
-
-fn default_bullet_model() -> String {
-    "llama3.2:1b".to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::AppConfig;
@@ -169,21 +89,10 @@ mod tests {
 [ollama]
 url = "http://localhost:11434"
 model = "llama3.2:1b"
-
-[models]
-clean = "llama3.2:1b"
-formal = "llama3.2:1b"
-casual = "llama3.2:1b"
-bullet = "llama3.2:1b"
-translate = "qwen2.5:1.5b"
-
-[mode]
-default = "clean"
 "#;
 
         let cfg: AppConfig = toml::from_str(input).expect("valid config TOML should parse");
         assert_eq!(cfg.ollama.url, "http://localhost:11434");
-        assert_eq!(cfg.mode.default, "clean");
-        assert_eq!(cfg.models.translate, "qwen2.5:1.5b");
+        assert_eq!(cfg.ollama.model, "llama3.2:1b");
     }
 }

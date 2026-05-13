@@ -7,11 +7,11 @@ use daemon::{Daemon, Request, Response, socket_path};
 use reqwest::StatusCode;
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::io::{self, Read};
 use std::io::IsTerminal;
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod client;
@@ -28,7 +28,8 @@ static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
 #[command(
     name = "e-voice",
     version,
-    about = "LLM-powered dictation post processor"
+    about = "LLM-powered dictation post processor",
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -37,20 +38,24 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    #[command(about = "Start the headless Unix socket daemon")]
     Daemon,
+    #[command(about = "Start daemon with system tray icon")]
     Tray,
+    #[command(
+        about = "Process stdin text through the LLM (called by voxtype as a post-process hook)"
+    )]
     Process,
-    Mode {
-        mode: String,
-    },
+    #[command(about = "Show daemon status")]
     Status {
-        #[arg(long)]
+        #[arg(long, help = "Output as JSON for Waybar integration")]
         format: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Poll continuously and print on mode changes")]
         follow: bool,
     },
+    #[command(about = "First-run setup wizard")]
     Setup,
-    Menu,
+    #[command(about = "Diagnose pipeline health")]
     Doctor,
 }
 
@@ -68,13 +73,26 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Commands::Daemon => run_headless_daemon().await,
-        Commands::Tray => run_tray_daemon(),
+        Commands::Tray => run_tray_daemon().await,
         Commands::Process => {
+            if io::stdin().is_terminal() {
+                return Err(
+                    "Pipe text via stdin, e.g.: echo 'hello' | e-voice process\n\
+                     The daemon must be running: e-voice daemon"
+                        .to_owned(),
+                );
+            }
+
             let mut input = String::new();
             io::stdin()
                 .read_to_string(&mut input)
                 .map_err(|e| format!("failed to read stdin: {e}"))?;
             let text = input.trim_end_matches('\n').to_owned();
+
+            if text.trim().is_empty() {
+                return Ok(());
+            }
+
             let request_id = next_request_id();
             info!(request_id = %request_id, input_len = text.len(), "starting process command");
 
@@ -89,24 +107,23 @@ async fn run(cli: Cli) -> Result<(), String> {
                 Ok(Response::Text(output)) => {
                     info!(request_id = %request_id, output_len = output.len(), "process command completed with daemon output");
                     print!("{output}");
-                }
-                Ok(Response::Error(_)) | Ok(_) | Err(_) => {
-                    warn!(request_id = %request_id, "process command fell back to raw input");
-                    print!("{input}");
-                }
-            }
-            Ok(())
-        }
-        Commands::Mode { mode } => {
-            let client = DaemonClient::new();
-            match client.send(Request::SetMode { mode: mode.clone() }).await {
-                Ok(Response::ModeChanged { mode }) => {
-                    println!("{mode}");
                     Ok(())
                 }
-                Ok(Response::Error(err)) => Err(format!("daemon error: {err}")),
-                Ok(other) => Err(format!("unexpected response: {other:?}")),
-                Err(err) => Err(format!("failed to reach daemon: {err}")),
+                Ok(Response::Error(err)) => {
+                    eprintln!("e-voice: daemon error: {err}");
+                    print!("{text}");
+                    Err("process failed with daemon error".to_owned())
+                }
+                Ok(other) => {
+                    eprintln!("e-voice: unexpected daemon response, falling back to raw input");
+                    print!("{text}");
+                    Err(format!("process failed: unexpected response {other:?}"))
+                }
+                Err(err) => {
+                    eprintln!("e-voice: daemon unreachable ({err}). Start it with: e-voice daemon");
+                    print!("{text}");
+                    Err("process failed: daemon unreachable".to_owned())
+                }
             }
         }
         Commands::Status { format, follow } => {
@@ -114,10 +131,6 @@ async fn run(cli: Cli) -> Result<(), String> {
             print_status(as_json, follow).await
         }
         Commands::Setup => setup::run_setup().map_err(|e| e.to_string()),
-        Commands::Menu => {
-            println!("{}", menu_json());
-            Ok(())
-        }
         Commands::Doctor => run_doctor().await,
     }
 }
@@ -131,7 +144,8 @@ async fn run_headless_daemon() -> Result<(), String> {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
 
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
@@ -157,23 +171,19 @@ async fn run_headless_daemon() -> Result<(), String> {
         .map_err(|e| format!("daemon failed: {e}"))
 }
 
-fn run_tray_daemon() -> Result<(), String> {
-    let runtime = tray::start_daemon_runtime().map_err(|e| e.to_string())?;
-    tray::run_tray_loop(runtime).map_err(|e| e.to_string())
+async fn run_tray_daemon() -> Result<(), String> {
+    tray::run().await.map_err(|e| e.to_string())
 }
 
 fn init_logging(command: &Commands) {
     let default_filter = match command {
         Commands::Daemon | Commands::Tray => "e_voice=info",
         Commands::Process => "off",
-        Commands::Mode { .. }
-        | Commands::Status { .. }
-        | Commands::Setup
-        | Commands::Menu
-        | Commands::Doctor => "off",
+        Commands::Status { .. } | Commands::Setup | Commands::Doctor => "off",
     };
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -227,19 +237,6 @@ async fn print_status(as_json: bool, follow: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn menu_json() -> String {
-    json!([
-        {"label": "Clean (remove fillers)", "value": "clean", "exec": "e-voice mode clean"},
-        {"label": "Formal (professional tone)", "value": "formal", "exec": "e-voice mode formal"},
-        {"label": "Casual (relaxed tone)", "value": "casual", "exec": "e-voice mode casual"},
-        {"label": "Bullet (format as list)", "value": "bullet", "exec": "e-voice mode bullet"},
-        {"label": "Translate to Spanish", "value": "translate:es", "exec": "e-voice mode translate:es"},
-        {"label": "Translate to Portuguese", "value": "translate:pt", "exec": "e-voice mode translate:pt"},
-        {"label": "Translate to French", "value": "translate:fr", "exec": "e-voice mode translate:fr"}
-    ])
-    .to_string()
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct OllamaTagsResponse {
     models: Vec<OllamaModelTag>,
@@ -270,7 +267,8 @@ async fn run_doctor() -> Result<(), String> {
     println!("[info] ollama url: {}", config.ollama.url);
     println!("[info] configured models: {}", configured_models.join(", "));
 
-    let sock = socket_path().map_err(|e| format!("doctor failed: cannot resolve socket path: {e}"))?;
+    let sock =
+        socket_path().map_err(|e| format!("doctor failed: cannot resolve socket path: {e}"))?;
     if sock.exists() {
         println!("[ok] daemon socket exists: {}", sock.display());
     } else {
@@ -280,7 +278,7 @@ async fn run_doctor() -> Result<(), String> {
 
     let client = DaemonClient::new();
     match client.send(Request::GetStatus).await {
-        Ok(Response::Status { mode, version }) => {
+        Ok(Response::Status { mode, version, .. }) => {
             println!("[ok] daemon reachable: mode={mode} version={version}");
         }
         Ok(Response::Error(err)) => {
@@ -307,8 +305,12 @@ async fn run_doctor() -> Result<(), String> {
         Ok(resp) if resp.status() == StatusCode::OK => {
             match resp.json::<OllamaTagsResponse>().await {
                 Ok(body) => {
-                    let available: BTreeSet<String> = body.models.into_iter().map(|m| m.name).collect();
-                    println!("[ok] ollama reachable: {} models available", available.len());
+                    let available: BTreeSet<String> =
+                        body.models.into_iter().map(|m| m.name).collect();
+                    println!(
+                        "[ok] ollama reachable: {} models available",
+                        available.len()
+                    );
 
                     let mut missing = Vec::new();
                     for model in &configured_models {
@@ -332,7 +334,10 @@ async fn run_doctor() -> Result<(), String> {
         }
         Ok(resp) => {
             failures += 1;
-            println!("[fail] ollama tags endpoint returned status {}", resp.status());
+            println!(
+                "[fail] ollama tags endpoint returned status {}",
+                resp.status()
+            );
         }
         Err(err) => {
             failures += 1;
@@ -351,10 +356,5 @@ async fn run_doctor() -> Result<(), String> {
 fn configured_models(config: &AppConfig) -> Vec<String> {
     let mut models = BTreeSet::new();
     models.insert(config.ollama.model.clone());
-    models.insert(config.models.clean.clone());
-    models.insert(config.models.formal.clone());
-    models.insert(config.models.casual.clone());
-    models.insert(config.models.bullet.clone());
-    models.insert(config.models.translate.clone());
     models.into_iter().collect()
 }

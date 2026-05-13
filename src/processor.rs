@@ -25,8 +25,36 @@ impl TextProcessor {
         Ok(Self { client, config })
     }
 
-    pub async fn process(&self, mode: &Mode, raw_text: &str, request_id: &str) -> String {
-        match self.process_inner(mode, raw_text, request_id).await {
+    pub fn config_model(&self) -> &str {
+        &self.config.ollama.model
+    }
+
+    pub async fn list_models(&self) -> Result<Vec<String>, ProcessorError> {
+        let url = format!("{}/api/tags", self.config.ollama.url.trim_end_matches('/'));
+        let response = self.client.get(&url).send().await?.error_for_status()?;
+        #[derive(Deserialize)]
+        struct TagsResponse {
+            models: Vec<TagEntry>,
+        }
+        #[derive(Deserialize)]
+        struct TagEntry {
+            name: String,
+        }
+        let body: TagsResponse = response.json().await?;
+        Ok(body.models.into_iter().map(|m| m.name).collect())
+    }
+
+    pub async fn process(
+        &self,
+        mode: &Mode,
+        raw_text: &str,
+        request_id: &str,
+        override_model: Option<&str>,
+    ) -> String {
+        match self
+            .process_inner(mode, raw_text, request_id, override_model)
+            .await
+        {
             Ok(output) if !output.trim().is_empty() => output,
             Ok(_) => {
                 warn!(request_id = %request_id, "processor returned empty output, falling back to raw text");
@@ -49,12 +77,15 @@ impl TextProcessor {
         mode: &Mode,
         raw_text: &str,
         request_id: &str,
+        override_model: Option<&str>,
     ) -> Result<String, ProcessorError> {
         let endpoint = format!(
             "{}/api/generate",
             self.config.ollama.url.trim_end_matches('/')
         );
-        let model = self.config.model_for_mode(mode).to_owned();
+        let model = override_model
+            .unwrap_or_else(|| self.config.model_for_mode(mode))
+            .to_owned();
         let payload = OllamaGenerateRequest {
             model: model.clone(),
             prompt: mode.prompt_template(raw_text),

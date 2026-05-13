@@ -1,13 +1,3 @@
 [ollama]
 url = "http://localhost:11434"
 model = "llama3.2:1b"
-
-[models]
-clean = "llama3.2:1b"
-formal = "llama3.2:1b"
-casual = "llama3.2:1b"
-bullet = "llama3.2:1b"
-translate = "qwen2.5:1.5b"
-
-[mode]
-default = "clean"

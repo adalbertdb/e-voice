@@ -112,22 +112,25 @@ mod tests {
         }
 
         let changed = client
-            .send(Request::SetMode {
-                mode: "bullet".to_owned(),
+            .send(Request::SetModel {
+                model: "llama3.2:3b".to_owned(),
             })
             .await
-            .expect("SetMode should succeed");
+            .expect("SetModel should succeed");
         match changed {
-            Response::ModeChanged { mode } => assert_eq!(mode, "bullet"),
+            Response::ModelChanged { model } => assert_eq!(model, "llama3.2:3b"),
             other => panic!("unexpected response: {other:?}"),
         }
 
         let status_after = client
             .send(Request::GetStatus)
             .await
-            .expect("GetStatus after SetMode should succeed");
+            .expect("GetStatus after SetModel should succeed");
         match status_after {
-            Response::Status { mode, .. } => assert_eq!(mode, "bullet"),
+            Response::Status { mode, model, .. } => {
+                assert_eq!(mode, "clean");
+                assert_eq!(model, "llama3.2:3b");
+            }
             other => panic!("unexpected response: {other:?}"),
         }
 

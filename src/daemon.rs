@@ -1,6 +1,6 @@
 //! Unix socket daemon for processing requests and managing runtime state.
 
-use crate::config::{AppConfig, ConfigError, load_state, save_state};
+use crate::config::{AppConfig, ConfigError};
 use crate::modes::Mode;
 use crate::processor::TextProcessor;
 use serde::{Deserialize, Serialize};
@@ -16,18 +16,19 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug)]
 pub struct AppState {
-    pub mode: Mode,
+    pub override_model: Option<String>,
     pub processor: TextProcessor,
 }
 
 impl AppState {
-    pub fn mode(&self) -> Mode {
-        self.mode.clone()
+    pub fn current_model(&self) -> String {
+        self.override_model
+            .clone()
+            .unwrap_or_else(|| self.processor.config_model().to_owned())
     }
 
-    pub fn set_mode(&mut self, mode: Mode) -> Result<(), ConfigError> {
-        self.mode = mode.clone();
-        save_state(&mode)
+    pub fn set_override_model(&mut self, model: String) {
+        self.override_model = Some(model);
     }
 }
 
@@ -40,7 +41,10 @@ pub enum Request {
         text: String,
         request_id: Option<String>,
     },
-    SetMode { mode: String },
+    SetModel {
+        model: String,
+    },
+    ListModels,
     GetStatus,
 }
 
@@ -48,8 +52,17 @@ pub enum Request {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum Response {
     Text(String),
-    ModeChanged { mode: String },
-    Status { mode: String, version: String },
+    ModelChanged {
+        model: String,
+    },
+    ModelsList {
+        models: Vec<String>,
+    },
+    Status {
+        mode: String,
+        model: String,
+        version: String,
+    },
     Error(String),
 }
 
@@ -68,15 +81,17 @@ impl Daemon {
         socket_path: PathBuf,
     ) -> Result<Self, DaemonError> {
         let processor = TextProcessor::new(config.clone())?;
-        let default_mode = config.default_mode();
-        let mode = load_state(&default_mode)?;
 
         Ok(Self {
             socket_path,
-            state: Arc::new(Mutex::new(AppState { mode, processor })),
+            state: Arc::new(Mutex::new(AppState {
+                override_model: None,
+                processor,
+            })),
         })
     }
 
+    #[allow(dead_code)]
     pub fn shared_state(&self) -> SharedState {
         Arc::clone(&self.state)
     }
@@ -145,7 +160,7 @@ pub async fn handle_request(request: Request, state: SharedState) -> Response {
         Request::Process { text, request_id } => {
             let request_id = request_id.unwrap_or_else(|| "unknown-request".to_owned());
             info!(request_id = %request_id, input_len = text.len(), "received process request");
-            let (mode, processor) = {
+            let (processor, override_model) = {
                 let guard = match state.lock() {
                     Ok(guard) => guard,
                     Err(_) => {
@@ -153,46 +168,49 @@ pub async fn handle_request(request: Request, state: SharedState) -> Response {
                         return Response::Error("failed to lock app state".to_owned());
                     }
                 };
-                (guard.mode(), guard.processor.clone())
+                (guard.processor.clone(), guard.override_model.clone())
             };
 
-            debug!(request_id = %request_id, mode = %mode, "forwarding text to processor");
-            let processed = processor.process(&mode, &text, &request_id).await;
+            let model_for_log = override_model
+                .as_deref()
+                .unwrap_or_else(|| processor.config_model());
+            debug!(request_id = %request_id, mode = "clean", model = %model_for_log, "forwarding text to processor");
+            let processed = processor
+                .process(&Mode::Clean, &text, &request_id, override_model.as_deref())
+                .await;
             info!(request_id = %request_id, output_len = processed.len(), "process request completed");
             Response::Text(processed)
         }
-        Request::SetMode { mode } => match mode.parse::<Mode>() {
-            Ok(parsed_mode) => {
-                let set_result = match state.lock() {
-                    Ok(mut guard) => guard.set_mode(parsed_mode.clone()),
-                    Err(_) => {
-                        error!("failed to lock app state for mode change");
-                        return Response::Error("failed to lock app state".to_owned());
-                    }
-                };
-
-                if let Err(err) = set_result {
-                    error!(error = %err, "failed to persist mode");
-                    return Response::Error(format!("failed to persist mode: {err}"));
+        Request::SetModel { model } => {
+            match state.lock() {
+                Ok(mut guard) => guard.set_override_model(model.clone()),
+                Err(_) => {
+                    error!("failed to lock app state for model change");
+                    return Response::Error("failed to lock app state".to_owned());
                 }
-
-                info!(mode = %parsed_mode, "mode changed");
-                Response::ModeChanged {
-                    mode: parsed_mode.to_string(),
-                }
+            };
+            info!(model = %model, "override model set");
+            Response::ModelChanged { model }
+        }
+        Request::ListModels => {
+            let processor = match state.lock() {
+                Ok(guard) => guard.processor.clone(),
+                Err(_) => return Response::Error("failed to lock app state".to_owned()),
+            };
+            match processor.list_models().await {
+                Ok(models) => Response::ModelsList { models },
+                Err(err) => Response::Error(format!("failed to list models: {err}")),
             }
-            Err(err) => Response::Error(err.to_string()),
-        },
+        }
         Request::GetStatus => {
-            let mode = {
-                match state.lock() {
-                    Ok(guard) => guard.mode().to_string(),
-                    Err(_) => return Response::Error("failed to lock app state".to_owned()),
-                }
+            let model = match state.lock() {
+                Ok(guard) => guard.current_model(),
+                Err(_) => return Response::Error("failed to lock app state".to_owned()),
             };
 
             Response::Status {
-                mode,
+                mode: "clean".to_owned(),
+                model,
                 version: VERSION.to_owned(),
             }
         }

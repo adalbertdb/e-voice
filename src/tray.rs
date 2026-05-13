@@ -1,421 +1,566 @@
-//! System tray integration and daemon orchestration for desktop mode switching.
+//! System tray for STT language and LLM model switching via ksni (StatusNotifierItem DBus).
 
 use crate::config::{AppConfig, config_file_path};
-use crate::daemon::{Daemon, Request, handle_request};
+use crate::daemon::{Daemon, Request, Response, socket_path};
+use ksni::TrayMethods;
 use std::process::Command;
-use std::sync::mpsc::{Receiver, channel};
-use std::thread;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::runtime::Builder;
 use tokio::sync::{mpsc, watch};
-use tray_icon::{
-    Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-};
+use tracing::{error, info, warn};
 
-const MODE_LABELS: [(&str, &str); 5] = [
-    ("clean", "Clean"),
-    ("formal", "Formal"),
-    ("casual", "Casual"),
-    ("bullet", "Bullet"),
-    ("translate:en", "Translate (EN)"),
+const STT_PRESETS: [(&str, &str, &str); 6] = [
+    ("English", "base.en", "en"),
+    ("Spanish", "base", "es"),
+    ("French", "base", "fr"),
+    ("Portuguese", "base", "pt"),
+    ("German", "base", "de"),
+    ("Italian", "base", "it"),
 ];
 
-#[derive(Debug, Clone)]
-pub enum DaemonControl {
-    SetMode(String),
+#[derive(Debug)]
+enum TrayCmd {
+    SetSttLanguage { model: String, language: String },
+    SetOllamaModel(String),
+    OpenConfig,
     Shutdown,
 }
 
-#[derive(Debug)]
-pub struct DaemonRuntime {
-    pub control_tx: mpsc::UnboundedSender<DaemonControl>,
-    pub mode_rx: Receiver<String>,
-    pub shutdown_rx: Receiver<()>,
-    pub initial_mode: String,
+#[derive(Debug, Clone)]
+struct HealthInfo {
+    ollama_reachable: bool,
+    voxtype_running: bool,
 }
 
-#[derive(Debug, Error)]
-pub enum TrayError {
-    #[error("failed to start daemon runtime: {0}")]
-    RuntimeStart(String),
-    #[error("tray icon error: {0}")]
-    TrayIcon(#[from] tray_icon::Error),
-    #[error("invalid tray icon data: {0}")]
-    BadIcon(#[from] tray_icon::BadIcon),
-    #[error("menu error: {0}")]
-    Menu(#[from] tray_icon::menu::Error),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("failed to open config path")]
-    ConfigPath,
+struct TrayState {
+    stt_label: String,
+    stt_model: String,
+    stt_language: String,
+    ollama_model: String,
+    ollama_models: Vec<String>,
+    health: HealthInfo,
+    control_tx: mpsc::UnboundedSender<TrayCmd>,
 }
 
-pub fn start_daemon_runtime() -> Result<DaemonRuntime, TrayError> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel::<DaemonControl>();
-    let (mode_tx, mode_rx) = channel::<String>();
-    let (shutdown_tx, shutdown_rx) = channel::<()>();
-    let (startup_tx, startup_rx) = channel::<Result<String, String>>();
+impl ksni::Tray for TrayState {
+    fn id(&self) -> String {
+        "e-voice".into()
+    }
 
-    thread::spawn(move || {
-        let runtime = match Builder::new_multi_thread().enable_all().build() {
-            Ok(rt) => rt,
-            Err(err) => {
-                let _ = startup_tx.send(Err(format!("failed to create tokio runtime: {err}")));
-                return;
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![build_icon(match &self.health {
+            HealthInfo {
+                ollama_reachable: true,
+                voxtype_running: true,
+            } => [0x4c, 0xaf, 0x50, 0xff],
+            HealthInfo {
+                ollama_reachable: false,
+                ..
+            } => [0xff, 0x98, 0x00, 0xff],
+            _ => [0xf4, 0x43, 0x36, 0xff],
+        })]
+    }
+
+    fn title(&self) -> String {
+        format!("e-voice: {}", self.stt_label)
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            title: "e-voice".into(),
+            description: format!(
+                "STT: {} ({})\nLLM: {}\nOllama: {}\nVoxtype: {}",
+                self.stt_label,
+                self.stt_model,
+                self.ollama_model,
+                if self.health.ollama_reachable {
+                    "connected"
+                } else {
+                    "unreachable"
+                },
+                if self.health.voxtype_running {
+                    "running"
+                } else {
+                    "stopped"
+                },
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::*;
+
+        let stt_selected = STT_PRESETS
+            .iter()
+            .position(|(_, m, l)| *m == self.stt_model && *l == self.stt_language)
+            .unwrap_or(0);
+
+        let ollama_selected = self
+            .ollama_models
+            .iter()
+            .position(|m| m == &self.ollama_model)
+            .unwrap_or(0);
+
+        let stt_options: Vec<RadioItem> = STT_PRESETS
+            .iter()
+            .map(|(label, _, _)| RadioItem {
+                label: label.to_string(),
+                ..Default::default()
+            })
+            .collect();
+
+        let ollama_options: Vec<RadioItem> = self
+            .ollama_models
+            .iter()
+            .map(|m| RadioItem {
+                label: m.clone(),
+                ..Default::default()
+            })
+            .collect();
+
+        let ollama_submenu_item = if ollama_options.is_empty() {
+            StandardItem {
+                label: "(no models found)".into(),
+                enabled: false,
+                ..Default::default()
             }
+            .into()
+        } else {
+            RadioGroup {
+                selected: ollama_selected,
+                select: Box::new(|this: &mut Self, idx| {
+                    if let Some(model) = this.ollama_models.get(idx) {
+                        let _ = this.control_tx.send(TrayCmd::SetOllamaModel(model.clone()));
+                    }
+                }),
+                options: ollama_options,
+            }
+            .into()
         };
 
-        runtime.block_on(async move {
-            let config = match AppConfig::load() {
-                Ok(cfg) => cfg,
-                Err(err) => {
-                    let _ = startup_tx.send(Err(format!("failed to load config: {err}")));
-                    return;
-                }
-            };
+        vec![
+            SubMenu {
+                label: "STT Language".into(),
+                submenu: vec![
+                    RadioGroup {
+                        selected: stt_selected,
+                        select: Box::new(|this: &mut Self, idx| {
+                            if let Some((_, model, lang)) = STT_PRESETS.get(idx) {
+                                let _ = this.control_tx.send(TrayCmd::SetSttLanguage {
+                                    model: model.to_string(),
+                                    language: lang.to_string(),
+                                });
+                            }
+                        }),
+                        options: stt_options,
+                    }
+                    .into(),
+                ],
+                ..Default::default()
+            }
+            .into(),
+            SubMenu {
+                label: "Ollama Model".into(),
+                submenu: vec![ollama_submenu_item],
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
+            StandardItem {
+                label: "Open Config".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.control_tx.send(TrayCmd::OpenConfig);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Quit".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.control_tx.send(TrayCmd::Shutdown);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+}
 
-            let daemon = match Daemon::new(config) {
-                Ok(d) => d,
-                Err(err) => {
-                    let _ = startup_tx.send(Err(format!("failed to initialize daemon: {err}")));
-                    return;
-                }
-            };
+fn build_icon(rgba: [u8; 4]) -> ksni::Icon {
+    let size = 24;
+    let mut data = Vec::with_capacity(size * size * 4);
+    for _ in 0..(size * size) {
+        data.extend_from_slice(&rgba);
+    }
+    ksni::Icon {
+        width: size as i32,
+        height: size as i32,
+        data,
+    }
+}
 
-            let state = daemon.shared_state();
-            let initial_mode = match state.lock() {
-                Ok(guard) => guard.mode().to_string(),
-                Err(_) => "clean".to_owned(),
-            };
-            let _ = startup_tx.send(Ok(initial_mode));
+pub async fn run() -> Result<(), TrayError> {
+    let config = AppConfig::load().map_err(|e| TrayError::Config(e.to_string()))?;
+    let ollama_url = config.ollama.url.clone();
+    let default_model = config.ollama.model.clone();
 
-            let (shutdown_signal_tx, shutdown_signal_rx) = watch::channel(false);
+    let daemon = Daemon::new(config).map_err(|e| TrayError::Daemon(e.to_string()))?;
 
-            let daemon_task = tokio::spawn(async move { daemon.run(shutdown_signal_rx).await });
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
-            let mode_sender_task = {
-                let state = state.clone();
-                let mode_tx = mode_tx.clone();
-                let mut stop = shutdown_signal_tx.subscribe();
-                tokio::spawn(async move {
-                    loop {
-                        if *stop.borrow() {
-                            break;
+    let daemon_task = {
+        let shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move { daemon.run(shutdown_rx).await })
+    };
+
+    let signal_task = {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = async {
+                        if let Some(sig) = sigterm.as_mut() {
+                            let _ = sig.recv().await;
                         }
+                    } => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            let _ = shutdown_tx.send(true);
+        })
+    };
 
-                        if let Ok(guard) = state.lock() {
-                            let _ = mode_tx.send(guard.mode().to_string());
-                        }
+    let (stt_label, stt_model, stt_language) = read_voxtype_stt_config();
+    let initial_health = check_health(&ollama_url);
+    let ollama_models = fetch_ollama_models(&ollama_url).await.unwrap_or_default();
 
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-                            changed = stop.changed() => {
-                                if changed.is_ok() && *stop.borrow() {
-                                    break;
-                                }
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+
+    let tray_state = TrayState {
+        stt_label,
+        stt_model,
+        stt_language,
+        ollama_model: default_model,
+        ollama_models,
+        health: initial_health,
+        control_tx: control_tx.clone(),
+    };
+
+    let tray_handle = match tray_state.spawn().await {
+        Ok(h) => h,
+        Err(err) => {
+            let _ = shutdown_tx.send(true);
+            return Err(TrayError::TraySpawn(format!("{err}")));
+        }
+    };
+
+    info!("tray icon spawned, entering command loop");
+
+    let mut health_tick = tokio::time::interval(Duration::from_secs(15));
+
+    loop {
+        tokio::select! {
+            cmd = control_rx.recv() => {
+                match cmd {
+                    Some(TrayCmd::SetSttLanguage { model, language }) => {
+                        let label = STT_PRESETS.iter()
+                            .find(|(_, m, l)| *m == model && *l == language)
+                            .map(|(label, _, _)| label.to_string())
+                            .unwrap_or_else(|| language.clone());
+
+                        let model_clone = model.clone();
+                        let lang_clone = language.clone();
+                        let label_clone = label.clone();
+
+                        match write_voxtype_stt_config(&model, &language) {
+                            Ok(()) => {
+                                info!(model = %model, language = %language, "voxtype STT config updated");
+                                let _ = Command::new("systemctl")
+                                    .args(["--user", "restart", "voxtype.service"])
+                                    .status();
+                                info!("voxtype service restarted");
+                                tray_handle.update(|tray: &mut TrayState| {
+                                    tray.stt_label = label_clone;
+                                    tray.stt_model = model_clone;
+                                    tray.stt_language = lang_clone;
+                                }).await;
+                                send_notification(
+                                    "STT Language",
+                                    &format!("Switched to {} ({})", label, model),
+                                );
+                            }
+                            Err(err) => {
+                                error!(%err, "failed to write voxtype config");
                             }
                         }
                     }
-                })
-            };
-
-            let signal_task = {
-                let shutdown_signal = shutdown_signal_tx.clone();
-                let shutdown_notice = shutdown_tx.clone();
-                tokio::spawn(async move {
-                    #[cfg(unix)]
-                    {
-                        let mut sigterm = tokio::signal::unix::signal(
-                            tokio::signal::unix::SignalKind::terminate(),
-                        )
-                        .ok();
-
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {}
-                            _ = async {
-                                if let Some(sig) = sigterm.as_mut() {
-                                    let _ = sig.recv().await;
-                                }
-                            } => {}
+                    Some(TrayCmd::SetOllamaModel(model)) => {
+                        match send_daemon_request(Request::SetModel { model: model.clone() }).await {
+                            Ok(Response::ModelChanged { .. }) => {
+                                info!(model = %model, "ollama model changed");
+                                tray_handle.update(|tray: &mut TrayState| {
+                                    tray.ollama_model = model.clone();
+                                }).await;
+                                send_notification(
+                                    "Ollama Model",
+                                    &format!("Switched to {}", model),
+                                );
+                            }
+                            Ok(other) => {
+                                warn!(response = ?other, "unexpected daemon response to SetModel");
+                            }
+                            Err(err) => {
+                                error!(%err, "failed to set ollama model via daemon");
+                            }
                         }
                     }
-
-                    #[cfg(not(unix))]
-                    {
-                        let _ = tokio::signal::ctrl_c().await;
+                    Some(TrayCmd::OpenConfig) => {
+                        if let Ok(path) = config_file_path() {
+                            let _ = Command::new("xdg-open")
+                                .arg(path)
+                                .status();
+                        }
                     }
-
-                    let _ = shutdown_signal.send(true);
-                    let _ = shutdown_notice.send(());
-                })
-            };
-
-            process_control_messages(
-                control_rx,
-                state,
-                shutdown_signal_tx.clone(),
-                shutdown_signal_tx.subscribe(),
-            )
-            .await;
-
-            let _ = shutdown_signal_tx.send(true);
-            let _ = signal_task.await;
-            let _ = mode_sender_task.await;
-            let _ = daemon_task.await;
-            let _ = shutdown_tx.send(());
-        });
-    });
-
-    let initial_mode = startup_rx
-        .recv()
-        .map_err(|_| TrayError::RuntimeStart("runtime did not report startup status".to_owned()))?
-        .map_err(TrayError::RuntimeStart)?;
-
-    Ok(DaemonRuntime {
-        control_tx,
-        mode_rx,
-        shutdown_rx,
-        initial_mode,
-    })
-}
-
-async fn process_control_messages(
-    mut control_rx: mpsc::UnboundedReceiver<DaemonControl>,
-    state: crate::daemon::SharedState,
-    shutdown_tx: watch::Sender<bool>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
-    loop {
-        tokio::select! {
-            maybe_command = control_rx.recv() => {
-                match maybe_command {
-                    Some(DaemonControl::SetMode(mode)) => {
-                        let _ = handle_request(Request::SetMode { mode }, state.clone()).await;
-                    }
-                    Some(DaemonControl::Shutdown) => {
+                    Some(TrayCmd::Shutdown) => {
                         let _ = shutdown_tx.send(true);
+                        tray_handle.shutdown().await;
                         break;
                     }
                     None => break,
                 }
             }
-            changed = shutdown_rx.changed() => {
-                if changed.is_ok() && *shutdown_rx.borrow() {
-                    break;
-                }
+            _ = health_tick.tick() => {
+                let health = check_health(&ollama_url);
+                let models = fetch_ollama_models(&ollama_url).await.unwrap_or_default();
+                let _ = tray_handle.update(|tray: &mut TrayState| {
+                    tray.health = health;
+                    if !models.is_empty() {
+                        tray.ollama_models = models;
+                    }
+                }).await;
+            }
+            _ = shutdown_rx.changed() => {
+                tray_handle.shutdown().await;
+                break;
             }
         }
     }
+
+    let _ = signal_task.await;
+    let daemon_result = daemon_task.await;
+    if let Err(err) = daemon_result {
+        error!(%err, "daemon task panicked");
+    }
+
+    Ok(())
 }
 
-pub fn run_tray_loop(runtime: DaemonRuntime) -> Result<(), TrayError> {
-    let mut tray = match TrayUi::new(runtime.control_tx.clone(), &runtime.initial_mode) {
-        Ok(ui) => Some(ui),
-        Err(err) => {
-            eprintln!("tray unavailable on this compositor/session: {err}");
-            None
-        }
+async fn send_daemon_request(request: Request) -> Result<Response, TrayError> {
+    let sock_path = socket_path()?;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let stream = UnixStream::connect(&sock_path).await?;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let payload = serde_json::to_string(&request)?;
+    writer.write_all(payload.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    let line = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| TrayError::Daemon("daemon closed connection".into()))?;
+
+    Ok(serde_json::from_str(&line)?)
+}
+
+fn read_voxtype_stt_config() -> (String, String, String) {
+    let path = voxtype_config_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return ("Unknown".into(), "base.en".into(), "en".into()),
     };
 
-    loop {
-        if runtime.shutdown_rx.try_recv().is_ok() {
-            break;
-        }
+    let model =
+        extract_toml_value_in_whisper(&content, "model").unwrap_or_else(|| "base.en".into());
+    let language =
+        extract_toml_value_in_whisper(&content, "language").unwrap_or_else(|| "en".into());
 
-        if let Ok(mode) = runtime.mode_rx.try_recv()
-            && let Some(ui) = tray.as_mut()
-        {
-            ui.set_mode(&mode);
-        }
+    let label = STT_PRESETS
+        .iter()
+        .find(|(_, m, l)| *m == model && *l == language)
+        .map(|(label, _, _)| label.to_string())
+        .unwrap_or_else(|| language.clone());
 
-        if let Some(ui) = tray.as_mut()
-            && ui.handle_events()?
-        {
-            break;
-        }
-
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    if let Some(ui) = tray.take() {
-        ui.shutdown();
-    }
-
-    let _ = runtime.control_tx.send(DaemonControl::Shutdown);
-    Ok(())
+    (label, model, language)
 }
 
-struct TrayUi {
-    tray_icon: TrayIcon,
-    menu_mode_items: Vec<(String, MenuItem, String)>,
-    open_config: MenuItem,
-    quit_item: MenuItem,
-    control_tx: mpsc::UnboundedSender<DaemonControl>,
-    current_mode: String,
+fn extract_toml_value_in_whisper(content: &str, key: &str) -> Option<String> {
+    let mut in_whisper = false;
+    let prefix = format!("{key} = \"");
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_whisper = trimmed == "[whisper]";
+            continue;
+        }
+
+        if in_whisper
+            && trimmed.starts_with(&prefix)
+            && let Some(start) = trimmed.find('"')
+            && let Some(end) = trimmed[start + 1..].find('"')
+        {
+            return Some(trimmed[start + 1..start + 1 + end].to_owned());
+        }
+    }
+    None
 }
 
-impl TrayUi {
-    fn new(
-        control_tx: mpsc::UnboundedSender<DaemonControl>,
-        initial_mode: &str,
-    ) -> Result<Self, TrayError> {
-        let display_set = std::env::var("DISPLAY").map(|s| !s.is_empty()).unwrap_or(false);
-        let wayland_set = std::env::var("WAYLAND_DISPLAY").map(|s| !s.is_empty()).unwrap_or(false);
-        if !display_set && !wayland_set {
-            return Err(TrayError::RuntimeStart(
-                "no display available".to_owned(),
-            ));
-        }
+fn write_voxtype_stt_config(model: &str, language: &str) -> Result<(), TrayError> {
+    let path = voxtype_config_path();
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
 
-        let menu = Menu::new();
+    let mut new_lines: Vec<String> = Vec::new();
+    let mut in_whisper = false;
+    let mut model_set = false;
+    let mut language_set = false;
 
-        let mut menu_mode_items = Vec::new();
-        for (value, label) in MODE_LABELS {
-            let item = MenuItem::with_id(format!("mode:{value}"), label, true, None);
-            menu.append(&item)?;
-            menu_mode_items.push((value.to_owned(), item, label.to_owned()));
-        }
-
-        let separator = PredefinedMenuItem::separator();
-        menu.append(&separator)?;
-
-        let open_config = MenuItem::with_id("open-config", "Open Config", true, None);
-        menu.append(&open_config)?;
-
-        let quit_item = MenuItem::with_id("quit", "Quit", true, None);
-        menu.append(&quit_item)?;
-
-        let tray_icon = TrayIconBuilder::new()
-            .with_icon(build_icon()?)
-            .with_tooltip(tooltip_for_mode(initial_mode))
-            .with_title(mode_title(initial_mode))
-            .with_menu(Box::new(menu))
-            .build()?;
-
-        let mut this = Self {
-            tray_icon,
-            menu_mode_items,
-            open_config,
-            quit_item,
-            control_tx,
-            current_mode: initial_mode.to_owned(),
-        };
-
-        this.render_menu_labels();
-        Ok(this)
-    }
-
-    fn set_mode(&mut self, mode: &str) {
-        if self.current_mode == mode {
-            return;
-        }
-        self.current_mode = mode.to_owned();
-        self.render_menu_labels();
-    }
-
-    fn render_menu_labels(&mut self) {
-        let _ = self
-            .tray_icon
-            .set_tooltip(Some(tooltip_for_mode(&self.current_mode)));
-        self.tray_icon
-            .set_title(Some(mode_title(&self.current_mode)));
-
-        for (value, item, base_label) in &self.menu_mode_items {
-            if *value == self.current_mode {
-                item.set_text(format!("✓ {base_label}"));
-            } else {
-                item.set_text(format!("  {base_label}"));
-            }
-        }
-    }
-
-    fn handle_events(&mut self) -> Result<bool, TrayError> {
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::Click {
-                button,
-                button_state,
-                ..
-            } = event
-                && button == MouseButton::Left
-                && button_state == MouseButtonState::Up
-            {
-                let next_mode = next_mode(&self.current_mode);
-                self.current_mode = next_mode.to_owned();
-                self.render_menu_labels();
-                let _ = self
-                    .control_tx
-                    .send(DaemonControl::SetMode(next_mode.to_owned()));
-            }
-        }
-
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == self.quit_item.id().clone() {
-                let _ = self.control_tx.send(DaemonControl::Shutdown);
-                return Ok(true);
-            }
-
-            if event.id == self.open_config.id().clone() {
-                open_config_file()?;
-            }
-
-            let mut selected_mode: Option<String> = None;
-            for (mode, item, _) in &self.menu_mode_items {
-                if event.id == item.id().clone() {
-                    selected_mode = Some(mode.clone());
-                    break;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_whisper {
+                if !model_set {
+                    new_lines.push(format!("model = \"{model}\""));
+                }
+                if !language_set {
+                    new_lines.push(format!("language = \"{language}\""));
                 }
             }
-
-            if let Some(mode) = selected_mode {
-                self.current_mode = mode.clone();
-                self.render_menu_labels();
-                let _ = self.control_tx.send(DaemonControl::SetMode(mode));
-            }
+            in_whisper = trimmed == "[whisper]";
+            new_lines.push(line.to_owned());
+            continue;
         }
 
-        Ok(false)
+        if in_whisper && trimmed.starts_with("model = \"") {
+            new_lines.push(format!("model = \"{model}\""));
+            model_set = true;
+        } else if in_whisper && trimmed.starts_with("language = \"") {
+            new_lines.push(format!("language = \"{language}\""));
+            language_set = true;
+        } else {
+            new_lines.push(line.to_owned());
+        }
     }
 
-    fn shutdown(self) {
-        drop(self.tray_icon);
+    if in_whisper {
+        if !model_set {
+            new_lines.push(format!("model = \"{model}\""));
+        }
+        if !language_set {
+            new_lines.push(format!("language = \"{language}\""));
+        }
     }
-}
 
-fn open_config_file() -> Result<(), TrayError> {
-    let config_path = config_file_path().map_err(|_| TrayError::ConfigPath)?;
-    let status = Command::new("xdg-open").arg(config_path).status()?;
-    if !status.success() {
-        return Err(TrayError::Io(std::io::Error::other(
-            "xdg-open returned non-zero status",
-        )));
+    if !new_lines.iter().any(|l| l.trim() == "[whisper]") {
+        if !new_lines.is_empty() {
+            new_lines.push(String::new());
+        }
+        new_lines.push("[whisper]".to_owned());
+        new_lines.push(format!("model = \"{model}\""));
+        new_lines.push(format!("language = \"{language}\""));
     }
+
+    std::fs::write(&path, new_lines.join("\n") + "\n")?;
     Ok(())
 }
 
-fn mode_title(mode: &str) -> String {
-    format!("e-voice: {mode}")
+fn voxtype_config_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    std::path::PathBuf::from(home).join(".config/voxtype/config.toml")
 }
 
-fn tooltip_for_mode(mode: &str) -> String {
-    format!("e-voice active | mode: {mode}")
-}
+fn check_health(ollama_url: &str) -> HealthInfo {
+    let ollama_reachable = std::process::Command::new("curl")
+        .args(["-sf", "--max-time", "2", &format!("{ollama_url}/api/tags")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
 
-fn next_mode(current_mode: &str) -> &'static str {
-    match current_mode {
-        "clean" => "formal",
-        "formal" => "casual",
-        "casual" => "bullet",
-        "bullet" => "translate:en",
-        _ => "clean",
+    let voxtype_running = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "voxtype.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    HealthInfo {
+        ollama_reachable,
+        voxtype_running,
     }
 }
 
-fn build_icon() -> Result<Icon, TrayError> {
-    let mut rgba = Vec::with_capacity(16 * 16 * 4);
-    for _ in 0..(16 * 16) {
-        rgba.extend_from_slice(&[0x29, 0x7a, 0xff, 0xff]);
+async fn fetch_ollama_models(ollama_url: &str) -> Result<Vec<String>, TrayError> {
+    let url = format!("{}/api/tags", ollama_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    #[derive(serde::Deserialize)]
+    struct TagsResponse {
+        models: Vec<TagEntry>,
     }
-    Ok(Icon::from_rgba(rgba, 16, 16)?)
+    #[derive(serde::Deserialize)]
+    struct TagEntry {
+        name: String,
+    }
+    let body: TagsResponse = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(body.models.into_iter().map(|m| m.name).collect())
+}
+
+fn send_notification(summary: &str, body: &str) {
+    let summary = summary.to_owned();
+    let body = body.to_owned();
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .icon("e-voice")
+            .timeout(notify_rust::Timeout::Milliseconds(3000))
+            .show();
+    });
+}
+
+#[derive(Debug, Error)]
+pub enum TrayError {
+    #[error("config error: {0}")]
+    Config(String),
+    #[error("daemon error: {0}")]
+    Daemon(String),
+    #[error("tray spawn error: {0}")]
+    TraySpawn(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("daemon socket error: {0}")]
+    Socket(#[from] crate::daemon::DaemonError),
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
 }
