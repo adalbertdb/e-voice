@@ -16,6 +16,7 @@ use transport::DaemonTransport;
 mod config;
 mod daemon;
 mod diagnostics;
+mod http_server;
 mod modes;
 mod processor;
 mod setup;
@@ -33,13 +34,18 @@ static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
     arg_required_else_help = true
 )]
 struct Cli {
+    /// Start only the HTTP server (no Tauri UI). Starts e-voice in headless
+    /// mode bound to 127.0.0.1 on the configured HTTP port.
+    #[arg(long, conflicts_with = "command")]
+    headless: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    #[command(about = "Start the headless Unix socket daemon")]
+    /// Start the headless Unix socket daemon (deprecated — use --headless instead)
     Daemon,
     #[command(about = "Start daemon with system tray icon")]
     Tray,
@@ -63,7 +69,7 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    init_logging(&cli.command);
+    init_logging(cli.headless, cli.command.as_ref());
 
     if let Err(err) = run(cli).await {
         eprintln!("{err}");
@@ -72,10 +78,14 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
+    if cli.headless {
+        return run_http_server().await;
+    }
+
     match cli.command {
-        Commands::Daemon => run_headless_daemon().await,
-        Commands::Tray => run_tray_daemon().await,
-        Commands::Process => {
+        Some(Commands::Daemon) => run_headless_daemon().await,
+        Some(Commands::Tray) => run_tray_daemon().await,
+        Some(Commands::Process) => {
             if io::stdin().is_terminal() {
                 return Err(
                     "Pipe text via stdin, e.g.: echo 'hello' | e-voice process\n\
@@ -129,15 +139,16 @@ async fn run(cli: Cli) -> Result<(), String> {
                 }
             }
         }
-        Commands::Status { format, follow } => {
+        Some(Commands::Status { format, follow }) => {
             let as_json = format.as_deref() == Some("json");
             print_status(as_json, follow).await
         }
-        Commands::Setup => {
+        Some(Commands::Setup) => {
             let adapter = system_adapter::LinuxSystemAdapter;
             setup::run_setup(&adapter).map_err(|e| e.to_string())
         }
-        Commands::Doctor => run_doctor().await,
+        Some(Commands::Doctor) => run_doctor().await,
+        None => unreachable!("clap guarantees either --headless or a subcommand is provided"),
     }
 }
 
@@ -177,16 +188,61 @@ async fn run_headless_daemon() -> Result<(), String> {
         .map_err(|e| format!("daemon failed: {e}"))
 }
 
+async fn run_http_server() -> Result<(), String> {
+    let config = AppConfig::load().map_err(|e| format!("failed to load config: {e}"))?;
+    let port = http_port_from_env().unwrap_or(http_server::DEFAULT_HTTP_PORT);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let signal_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = async {
+                    if let Some(sig) = sigterm.as_mut() {
+                        let _ = sig.recv().await;
+                    }
+                } => {}
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+
+        let _ = signal_tx.send(true);
+    });
+
+    http_server::run(config, port, shutdown_rx)
+        .await
+        .map_err(|e| format!("HTTP server failed: {e}"))
+}
+
+fn http_port_from_env() -> Option<u16> {
+    std::env::var("E_VOICE_HTTP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
 async fn run_tray_daemon() -> Result<(), String> {
     let adapter = system_adapter::LinuxSystemAdapter;
     tray::run(&adapter).await.map_err(|e| e.to_string())
 }
 
-fn init_logging(command: &Commands) {
-    let default_filter = match command {
-        Commands::Daemon | Commands::Tray => "e_voice=info",
-        Commands::Process => "off",
-        Commands::Status { .. } | Commands::Setup | Commands::Doctor => "off",
+fn init_logging(headless: bool, command: Option<&Commands>) {
+    let default_filter = if headless {
+        "e_voice=info"
+    } else {
+        match command {
+            Some(Commands::Daemon | Commands::Tray) => "e_voice=info",
+            Some(Commands::Process) => "off",
+            Some(Commands::Status { .. } | Commands::Setup | Commands::Doctor) | None => "off",
+        }
     };
 
     let filter =
@@ -294,3 +350,4 @@ fn render_check_status(status: CheckStatus) -> &'static str {
         CheckStatus::Warn => "warn",
     }
 }
+
