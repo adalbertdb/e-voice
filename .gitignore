@@ -9,6 +9,7 @@ openspec/
 node_modules/
 src-frontend/node_modules/
 src-frontend/dist/
+src-frontend/src/*.js
 
 # Tauri build artifacts
 src-tauri/target/

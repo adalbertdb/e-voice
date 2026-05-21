@@ -50,12 +50,44 @@ impl RunMode {
 }
 
 /// Start the application in headless mode (no Tauri, HTTP server only).
+///
+/// Logs the listening address to stdout, then blocks until SIGTERM / Ctrl-C is
+/// received so the process exits cleanly.
 pub fn run_headless(port: u16) {
     info!("headless mode, HTTP server on {port}");
     println!("headless mode, HTTP server on {port}");
+
     // HTTP server will be wired up in a future slice (issue #10).
-    // For now we park the thread so process lifetime is observable.
-    std::thread::park();
+    // Block until the process receives a shutdown signal so that the process
+    // lifetime is observable and can be terminated gracefully.
+    let rt = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
+    rt.block_on(async move {
+        wait_for_shutdown_signal().await;
+        info!("headless mode shutting down");
+    });
+}
+
+/// Wait for SIGTERM or Ctrl-C.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                if let Some(sig) = sigterm.as_mut() {
+                    let _ = sig.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Start the full Tauri desktop application.
