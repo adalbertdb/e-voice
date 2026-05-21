@@ -7,12 +7,12 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckStatus {
     Ok,
     Fail,
     Info,
+    #[allow(dead_code)]
     Warn,
 }
 
