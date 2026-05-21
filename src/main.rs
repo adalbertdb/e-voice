@@ -204,7 +204,7 @@ async fn print_status(as_json: bool, follow: bool) -> Result<(), String> {
     let client = DaemonTransport::new(
         socket_path().map_err(|e| format!("failed to resolve socket path: {e}"))?,
     );
-    let mut last_mode: Option<String> = None;
+    let mut last_printed = false;
 
     loop {
         let response = client
@@ -212,24 +212,24 @@ async fn print_status(as_json: bool, follow: bool) -> Result<(), String> {
             .await
             .map_err(|e| format!("failed to query daemon status: {e}"))?;
 
-        let mode = match response {
-            Response::Status { mode, .. } => mode,
+        match response {
+            Response::Status { .. } => {}
             Response::Error(err) => return Err(format!("daemon error: {err}")),
             other => return Err(format!("unexpected response: {other:?}")),
-        };
+        }
 
-        if last_mode.as_deref() != Some(mode.as_str()) {
+        if !last_printed || follow {
             if as_json {
                 let payload = json!({
-                    "text": mode.clone(),
-                    "class": mode.clone(),
-                    "tooltip": format!("e-voice active | mode: {}", mode),
+                    "text": "active",
+                    "class": "active",
+                    "tooltip": "e-voice active",
                 });
                 println!("{payload}");
             } else {
-                println!("{mode}");
+                println!("active");
             }
-            last_mode = Some(mode);
+            last_printed = true;
         }
 
         if !follow {
@@ -282,8 +282,8 @@ async fn run_doctor() -> Result<(), String> {
 
     let client = DaemonTransport::new(sock);
     match client.send(Request::GetStatus).await {
-        Ok(Response::Status { mode, version, .. }) => {
-            println!("[ok] daemon reachable: mode={mode} version={version}");
+        Ok(Response::Status { version, .. }) => {
+            println!("[ok] daemon reachable: version={version}");
         }
         Ok(Response::Error(err)) => {
             failures += 1;

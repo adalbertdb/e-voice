@@ -96,8 +96,9 @@ mod tests {
             .await
             .expect("GetStatus should succeed");
         match status {
-            Response::Status { mode, .. } => {
-                assert!(!mode.is_empty(), "mode should not be empty");
+            Response::Status { model, version } => {
+                assert!(!model.is_empty(), "model should not be empty");
+                assert!(!version.is_empty(), "version should not be empty");
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -118,9 +119,9 @@ mod tests {
             .await
             .expect("GetStatus after SetModel should succeed");
         match status_after {
-            Response::Status { mode, model, .. } => {
-                assert_eq!(mode, "clean");
+            Response::Status { model, version } => {
                 assert_eq!(model, "llama3.2:3b");
+                assert!(!version.is_empty(), "version should not be empty");
             }
             other => panic!("unexpected response: {other:?}"),
         }

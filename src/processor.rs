@@ -1,4 +1,4 @@
-//! Ollama-backed text processor with mode-aware prompt construction.
+//! Ollama-backed text processor. Prompt construction is an internal detail.
 
 use crate::config::AppConfig;
 use crate::modes::Mode;
@@ -46,13 +46,12 @@ impl TextProcessor {
 
     pub async fn process(
         &self,
-        mode: &Mode,
         raw_text: &str,
         request_id: &str,
         override_model: Option<&str>,
     ) -> String {
         match self
-            .process_inner(mode, raw_text, request_id, override_model)
+            .process_inner(raw_text, request_id, override_model)
             .await
         {
             Ok(output) if !output.trim().is_empty() => output,
@@ -74,7 +73,6 @@ impl TextProcessor {
 
     async fn process_inner(
         &self,
-        mode: &Mode,
         raw_text: &str,
         request_id: &str,
         override_model: Option<&str>,
@@ -84,17 +82,16 @@ impl TextProcessor {
             self.config.ollama.url.trim_end_matches('/')
         );
         let model = override_model
-            .unwrap_or_else(|| self.config.model_for_mode(mode))
+            .unwrap_or(&self.config.ollama.model)
             .to_owned();
         let payload = OllamaGenerateRequest {
             model: model.clone(),
-            prompt: mode.prompt_template(raw_text),
+            prompt: Mode::Clean.prompt_template(raw_text),
             stream: false,
         };
 
         info!(
             request_id = %request_id,
-            mode = %mode,
             model = %model,
             endpoint = %endpoint,
             input_len = raw_text.len(),
