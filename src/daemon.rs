@@ -1,7 +1,6 @@
 //! Unix socket daemon for processing requests and managing runtime state.
 
 use crate::config::{AppConfig, ConfigError};
-use crate::modes::Mode;
 use crate::processor::TextProcessor;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -59,7 +58,6 @@ pub enum Response {
         models: Vec<String>,
     },
     Status {
-        mode: String,
         model: String,
         version: String,
     },
@@ -174,9 +172,9 @@ pub async fn handle_request(request: Request, state: SharedState) -> Response {
             let model_for_log = override_model
                 .as_deref()
                 .unwrap_or_else(|| processor.config_model());
-            debug!(request_id = %request_id, mode = "clean", model = %model_for_log, "forwarding text to processor");
+            debug!(request_id = %request_id, model = %model_for_log, "forwarding text to processor");
             let processed = processor
-                .process(&Mode::Clean, &text, &request_id, override_model.as_deref())
+                .process(&text, &request_id, override_model.as_deref())
                 .await;
             info!(request_id = %request_id, output_len = processed.len(), "process request completed");
             Response::Text(processed)
@@ -209,7 +207,6 @@ pub async fn handle_request(request: Request, state: SharedState) -> Response {
             };
 
             Response::Status {
-                mode: "clean".to_owned(),
                 model,
                 version: VERSION.to_owned(),
             }

@@ -1,6 +1,5 @@
 //! Configuration loading, defaults, and persistent daemon state paths.
 
-use crate::modes::Mode;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,10 +37,6 @@ impl AppConfig {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let content = fs::read_to_string(path.as_ref())?;
         Ok(toml::from_str(&content)?)
-    }
-
-    pub fn model_for_mode(&self, _mode: &Mode) -> &str {
-        &self.ollama.model
     }
 }
 

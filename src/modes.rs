@@ -1,13 +1,14 @@
 //! Processing profile for prompt construction.
+//! `Mode` is a private implementation detail of the processor module.
+//! It is not exposed in the public interface and will evolve into the Profile system.
 
-use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 const OUTPUT_SUFFIX: &str = "\nOutput only the processed text. No explanations, no quotes, no commentary.\n\nInput: \"{text}\"\nOutput:";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Mode {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Mode {
     Clean,
 }
 
