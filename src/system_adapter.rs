@@ -22,6 +22,39 @@ pub const STT_PRESETS: [(&str, &str, &str); 6] = [
 
 const POST_PROCESS_BLOCK: &str = "[output.post_process]\ncommand = \"e-voice process\"\ntimeout_ms = 10000\n";
 
+/// Write a voxtype `[output.post_process]` block that POSTs directly to the
+/// e-voice HTTP server at `http://127.0.0.1:{port}/process`.
+pub fn patch_voxtype_http_hook_at_path(
+    path: &Path,
+    port: u16,
+) -> AdapterResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let http_block = format!(
+        "[output.post_process]\nurl = \"http://127.0.0.1:{port}/process\"\ntimeout_ms = 10000\n"
+    );
+
+    let mut content = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+
+    let url_marker = format!("http://127.0.0.1:{port}/process");
+    if content.contains("[output.post_process]") && content.contains(&url_marker) {
+        return Ok(());
+    }
+
+    if !content.ends_with('\n') && !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(&http_block);
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
 /// Abstracts all platform-specific OS operations so that callers can be tested
 /// with a [`FakeSystemAdapter`] without touching the real filesystem or running
 /// real processes.
