@@ -1,7 +1,7 @@
 //! Ollama-backed text processor. Prompt construction is an internal detail.
 
 use crate::config::AppConfig;
-use crate::modes::Mode;
+use crate::modes::Profile;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -49,9 +49,10 @@ impl TextProcessor {
         raw_text: &str,
         request_id: &str,
         override_model: Option<&str>,
+        profile: &Profile,
     ) -> String {
         match self
-            .process_inner(raw_text, request_id, override_model)
+            .process_inner(raw_text, request_id, override_model, profile)
             .await
         {
             Ok(output) if !output.trim().is_empty() => output,
@@ -76,6 +77,7 @@ impl TextProcessor {
         raw_text: &str,
         request_id: &str,
         override_model: Option<&str>,
+        profile: &Profile,
     ) -> Result<String, ProcessorError> {
         let endpoint = format!(
             "{}/api/generate",
@@ -86,7 +88,7 @@ impl TextProcessor {
             .to_owned();
         let payload = OllamaGenerateRequest {
             model: model.clone(),
-            prompt: Mode::Clean.prompt_template(raw_text),
+            prompt: profile.prompt_for(raw_text),
             stream: false,
         };
 
