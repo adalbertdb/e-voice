@@ -7,15 +7,33 @@ use thiserror::Error;
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../config/default.toml");
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct AppConfig {
-    pub ollama: OllamaConfig,
+/// Which LLM backend to use.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    #[default]
+    Ollama,
+    LmStudio,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct OllamaConfig {
+pub struct LlmConfig {
+    #[serde(default)]
+    pub backend: Backend,
     pub url: String,
     pub model: String,
+    /// Seconds to keep the model loaded after a request. `-1` means keep forever.
+    #[serde(default = "default_keep_alive_secs")]
+    pub keep_alive_secs: i64,
+}
+
+fn default_keep_alive_secs() -> i64 {
+    300
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppConfig {
+    pub llm: LlmConfig,
 }
 
 impl Default for AppConfig {
@@ -69,25 +87,45 @@ pub fn config_file_path() -> Result<PathBuf, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, Backend};
 
     #[test]
     fn default_config_loads() {
         let cfg = AppConfig::default();
-        assert!(!cfg.ollama.url.is_empty());
-        assert!(!cfg.ollama.model.is_empty());
+        assert!(!cfg.llm.url.is_empty());
+        assert!(!cfg.llm.model.is_empty());
+        assert_eq!(cfg.llm.backend, Backend::Ollama);
+        assert_eq!(cfg.llm.keep_alive_secs, 300);
     }
 
     #[test]
     fn parses_toml_into_config() {
         let input = r#"
-[ollama]
+[llm]
+backend = "ollama"
 url = "http://localhost:11434"
 model = "llama3.2:1b"
+keep_alive_secs = 60
 "#;
 
         let cfg: AppConfig = toml::from_str(input).expect("valid config TOML should parse");
-        assert_eq!(cfg.ollama.url, "http://localhost:11434");
-        assert_eq!(cfg.ollama.model, "llama3.2:1b");
+        assert_eq!(cfg.llm.url, "http://localhost:11434");
+        assert_eq!(cfg.llm.model, "llama3.2:1b");
+        assert_eq!(cfg.llm.keep_alive_secs, 60);
+    }
+
+    #[test]
+    fn parses_lm_studio_backend() {
+        let input = r#"
+[llm]
+backend = "lm_studio"
+url = "http://localhost:1234"
+model = "lmstudio-community/meta-llama-3.1-8b-instruct-gguf"
+keep_alive_secs = 120
+"#;
+
+        let cfg: AppConfig = toml::from_str(input).expect("lm_studio config should parse");
+        assert_eq!(cfg.llm.backend, Backend::LmStudio);
+        assert_eq!(cfg.llm.url, "http://localhost:1234");
     }
 }

@@ -146,15 +146,17 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, OllamaConfig};
+    use crate::config::{AppConfig, Backend, LlmConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener as TokioListener;
 
     fn make_config(ollama_url: String) -> AppConfig {
         AppConfig {
-            ollama: OllamaConfig {
+            llm: LlmConfig {
+                backend: Backend::Ollama,
                 url: ollama_url,
                 model: "test-model".to_owned(),
+                keep_alive_secs: 300,
             },
         }
     }

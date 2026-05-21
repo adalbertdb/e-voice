@@ -51,7 +51,7 @@ pub async fn run<A: SystemAdapter>(
     let mut results = vec![
         CheckResult::new(
             CheckStatus::Info,
-            format!("ollama url: {}", config.ollama.url),
+            format!("llm url: {}", config.llm.url),
         ),
         CheckResult::new(
             CheckStatus::Info,
@@ -99,7 +99,7 @@ pub async fn run<A: SystemAdapter>(
         }
     }
 
-    if !system.check_ollama_health(&config.ollama.url).await {
+    if !system.check_ollama_health(&config.llm.url).await {
         results.push(CheckResult::new(
             CheckStatus::Fail,
             "ollama unreachable: health check failed",
@@ -107,7 +107,7 @@ pub async fn run<A: SystemAdapter>(
         return results;
     }
 
-    let tags_url = format!("{}/api/tags", config.ollama.url.trim_end_matches('/'));
+    let tags_url = format!("{}/api/tags", config.llm.url.trim_end_matches('/'));
     let http = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -178,7 +178,7 @@ pub async fn run<A: SystemAdapter>(
 
 fn configured_models(config: &AppConfig) -> Vec<String> {
     let mut models = BTreeSet::new();
-    models.insert(config.ollama.model.clone());
+    models.insert(config.llm.model.clone());
     models.into_iter().collect()
 }
 
@@ -200,9 +200,11 @@ mod tests {
 
     fn test_config(ollama_url: String, model: &str) -> AppConfig {
         AppConfig {
-            ollama: crate::config::OllamaConfig {
+            llm: crate::config::LlmConfig {
+                backend: crate::config::Backend::Ollama,
                 url: ollama_url,
                 model: model.to_owned(),
+                keep_alive_secs: 300,
             },
         }
     }
