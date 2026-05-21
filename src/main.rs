@@ -3,25 +3,25 @@
 use clap::{Parser, Subcommand};
 use config::AppConfig;
 use daemon::{Daemon, Request, Response, socket_path};
-use transport::DaemonTransport;
-use reqwest::StatusCode;
+use diagnostics::CheckStatus;
 use serde_json::json;
-use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use transport::DaemonTransport;
 
 mod config;
 mod daemon;
+mod diagnostics;
 mod modes;
 mod processor;
 mod setup;
 mod system_adapter;
-mod tray;
 mod transport;
+mod tray;
 
 static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -246,19 +246,7 @@ async fn print_status(as_json: bool, follow: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct OllamaTagsResponse {
-    models: Vec<OllamaModelTag>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct OllamaModelTag {
-    name: String,
-}
-
 async fn run_doctor() -> Result<(), String> {
-    let mut failures = 0usize;
-
     println!("e-voice doctor");
 
     let config = match AppConfig::load() {
@@ -272,86 +260,22 @@ async fn run_doctor() -> Result<(), String> {
         }
     };
 
-    let configured_models = configured_models(&config);
-    println!("[info] ollama url: {}", config.ollama.url);
-    println!("[info] configured models: {}", configured_models.join(", "));
-
     let sock =
         socket_path().map_err(|e| format!("doctor failed: cannot resolve socket path: {e}"))?;
-    if sock.exists() {
-        println!("[ok] daemon socket exists: {}", sock.display());
-    } else {
-        failures += 1;
-        println!("[fail] daemon socket missing: {}", sock.display());
-    }
+    let client = DaemonTransport::new(sock.clone());
+    let adapter = system_adapter::LinuxSystemAdapter;
+    let results = diagnostics::run(&config, &client, sock, &adapter).await;
 
-    let client = DaemonTransport::new(sock);
-    match client.send(Request::GetStatus).await {
-        Ok(Response::Status { version, .. }) => {
-            println!("[ok] daemon reachable: version={version}");
-        }
-        Ok(Response::Error(err)) => {
+    let mut failures = 0usize;
+    for result in results {
+        if result.status == CheckStatus::Fail {
             failures += 1;
-            println!("[fail] daemon error response: {err}");
         }
-        Ok(other) => {
-            failures += 1;
-            println!("[fail] unexpected daemon response: {other:?}");
-        }
-        Err(err) => {
-            failures += 1;
-            println!("[fail] daemon unreachable: {err}");
-        }
-    }
-
-    let tags_url = format!("{}/api/tags", config.ollama.url.trim_end_matches('/'));
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("doctor failed: cannot initialize HTTP client: {e}"))?;
-
-    match http.get(&tags_url).send().await {
-        Ok(resp) if resp.status() == StatusCode::OK => {
-            match resp.json::<OllamaTagsResponse>().await {
-                Ok(body) => {
-                    let available: BTreeSet<String> =
-                        body.models.into_iter().map(|m| m.name).collect();
-                    println!(
-                        "[ok] ollama reachable: {} models available",
-                        available.len()
-                    );
-
-                    let mut missing = Vec::new();
-                    for model in &configured_models {
-                        if !available.contains(model) {
-                            missing.push(model.clone());
-                        }
-                    }
-
-                    if missing.is_empty() {
-                        println!("[ok] configured models available in ollama");
-                    } else {
-                        failures += 1;
-                        println!("[fail] missing models in ollama: {}", missing.join(", "));
-                    }
-                }
-                Err(err) => {
-                    failures += 1;
-                    println!("[fail] ollama tags parse failed: {err}");
-                }
-            }
-        }
-        Ok(resp) => {
-            failures += 1;
-            println!(
-                "[fail] ollama tags endpoint returned status {}",
-                resp.status()
-            );
-        }
-        Err(err) => {
-            failures += 1;
-            println!("[fail] ollama unreachable: {err}");
-        }
+        println!(
+            "[{}] {}",
+            render_check_status(result.status),
+            result.message
+        );
     }
 
     if failures == 0 {
@@ -362,8 +286,11 @@ async fn run_doctor() -> Result<(), String> {
     }
 }
 
-fn configured_models(config: &AppConfig) -> Vec<String> {
-    let mut models = BTreeSet::new();
-    models.insert(config.ollama.model.clone());
-    models.into_iter().collect()
+fn render_check_status(status: CheckStatus) -> &'static str {
+    match status {
+        CheckStatus::Ok => "ok",
+        CheckStatus::Fail => "fail",
+        CheckStatus::Info => "info",
+        CheckStatus::Warn => "warn",
+    }
 }
