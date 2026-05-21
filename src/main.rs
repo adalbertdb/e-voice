@@ -19,6 +19,7 @@ mod daemon;
 mod modes;
 mod processor;
 mod setup;
+mod system_adapter;
 mod tray;
 mod transport;
 
@@ -132,7 +133,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             let as_json = format.as_deref() == Some("json");
             print_status(as_json, follow).await
         }
-        Commands::Setup => setup::run_setup().map_err(|e| e.to_string()),
+        Commands::Setup => {
+            let adapter = system_adapter::LinuxSystemAdapter;
+            setup::run_setup(&adapter).map_err(|e| e.to_string())
+        }
         Commands::Doctor => run_doctor().await,
     }
 }
@@ -174,7 +178,8 @@ async fn run_headless_daemon() -> Result<(), String> {
 }
 
 async fn run_tray_daemon() -> Result<(), String> {
-    tray::run().await.map_err(|e| e.to_string())
+    let adapter = system_adapter::LinuxSystemAdapter;
+    tray::run(&adapter).await.map_err(|e| e.to_string())
 }
 
 fn init_logging(command: &Commands) {

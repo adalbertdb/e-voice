@@ -1,23 +1,16 @@
 //! First-run setup wizard for voxtype, Ollama, and Omarchy snippets.
 
-use crate::config::{AppConfig, config_dir, config_file_path};
+use crate::config::{config_dir, config_file_path, AppConfig};
+use crate::system_adapter::SystemAdapter;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 use thiserror::Error;
 
-const USER_SERVICE_NAME: &str = "e-voice.service";
 const USER_SERVICE_CONTENT: &str = include_str!("../packaging/e-voice.service");
 
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
-
-const POST_PROCESS_BLOCK: &str = r#"[output.post_process]
-command = "e-voice process"
-timeout_ms = 10000
-"#;
 
 const HYPRLAND_SNIPPET: &str = r#"# e-voice / voxtype keybindings
 # Paste into ~/.config/hypr/bindings.conf
@@ -33,20 +26,35 @@ const WAYBAR_SNIPPET: &str = r#""custom/e-voice": {
 }
 "#;
 
-pub fn run_setup() -> Result<(), SetupError> {
+pub fn run_setup<A: SystemAdapter>(adapter: &A) -> Result<(), SetupError> {
     info("Step 1: checking voxtype installation");
-    check_binary("voxtype")?;
+    if !adapter.is_binary_available("voxtype") {
+        failure("voxtype is not installed");
+        return Err(SetupError::MissingDependency("voxtype".to_owned()));
+    }
+    success("Found voxtype");
 
     info("Step 2: patching voxtype config");
-    patch_voxtype_config()?;
+    adapter
+        .patch_voxtype_post_process_hook()
+        .map_err(|e| SetupError::Adapter(e.to_string()))?;
+    success("voxtype post_process hook configured");
 
     info("Step 3: checking ollama installation");
-    check_binary("ollama")?;
+    if !adapter.is_binary_available("ollama") {
+        failure("ollama is not installed");
+        return Err(SetupError::MissingDependency("ollama".to_owned()));
+    }
+    success("Found ollama");
 
     info("Step 4: pulling required models");
-    run_command("ollama", &["pull", "llama3.2:1b"])?;
+    adapter
+        .pull_ollama_model("llama3.2:1b")
+        .map_err(|e| SetupError::Adapter(e.to_string()))?;
     success("Pulled model llama3.2:1b");
-    run_command("ollama", &["pull", "qwen2.5:1.5b"])?;
+    adapter
+        .pull_ollama_model("qwen2.5:1.5b")
+        .map_err(|e| SetupError::Adapter(e.to_string()))?;
     success("Pulled model qwen2.5:1.5b");
 
     info("Step 5: ensuring e-voice config exists");
@@ -59,35 +67,12 @@ pub fn run_setup() -> Result<(), SetupError> {
     write_snippet("waybar-snippet.json", WAYBAR_SNIPPET)?;
 
     info("Step 8: enabling user service if available");
-    maybe_enable_service()?;
+    adapter
+        .enable_autostart(USER_SERVICE_CONTENT)
+        .map_err(|e| SetupError::Adapter(e.to_string()))?;
+    success("Enabled and started e-voice user service");
 
     success("Setup completed");
-    Ok(())
-}
-
-fn patch_voxtype_config() -> Result<(), SetupError> {
-    let voxtype_config = voxtype_config_path()?;
-    if let Some(parent) = voxtype_config.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut content = if voxtype_config.exists() {
-        fs::read_to_string(&voxtype_config)?
-    } else {
-        String::new()
-    };
-
-    if content.contains("[output.post_process]") && content.contains("e-voice process") {
-        info("voxtype post_process hook already configured");
-        return Ok(());
-    }
-
-    if !content.ends_with('\n') && !content.is_empty() {
-        content.push('\n');
-    }
-    content.push_str(POST_PROCESS_BLOCK);
-    fs::write(voxtype_config, content)?;
-    success("Patched voxtype config with post_process hook");
     Ok(())
 }
 
@@ -117,56 +102,6 @@ fn write_snippet(file_name: &str, content: &str) -> Result<(), SetupError> {
     Ok(())
 }
 
-fn maybe_enable_service() -> Result<(), SetupError> {
-    let service_path = expand_home(&format!(".config/systemd/user/{USER_SERVICE_NAME}"))?;
-    if let Some(parent) = service_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::write(&service_path, USER_SERVICE_CONTENT)?;
-    success(&format!(
-        "Installed user service to {}",
-        service_path.display()
-    ));
-
-    run_command("systemctl", &["--user", "daemon-reload"])?;
-    run_command("systemctl", &["--user", "enable", "--now", "e-voice"])?;
-    success("Enabled and started e-voice user service");
-    Ok(())
-}
-
-fn check_binary(binary: &str) -> Result<(), SetupError> {
-    let status = Command::new("which").arg(binary).status()?;
-    if status.success() {
-        success(&format!("Found {binary}"));
-        Ok(())
-    } else {
-        failure(&format!("{binary} is not installed"));
-        Err(SetupError::MissingDependency(binary.to_owned()))
-    }
-}
-
-fn run_command(program: &str, args: &[&str]) -> Result<(), SetupError> {
-    let status = Command::new(program).args(args).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(SetupError::CommandFailed(format!(
-            "{program} {}",
-            args.join(" ")
-        )))
-    }
-}
-
-fn voxtype_config_path() -> Result<PathBuf, SetupError> {
-    expand_home(".config/voxtype/config.toml")
-}
-
-fn expand_home(path: &str) -> Result<PathBuf, SetupError> {
-    let home = std::env::var("HOME").map_err(|_| SetupError::MissingHome)?;
-    Ok(Path::new(&home).join(path))
-}
-
 fn success(message: &str) {
     println!("{GREEN}✓{RESET} {message}");
 }
@@ -183,14 +118,45 @@ fn info(message: &str) {
 pub enum SetupError {
     #[error("missing dependency: {0}")]
     MissingDependency(String),
-    #[error("command failed: {0}")]
-    CommandFailed(String),
-    #[error("$HOME is not set")]
-    MissingHome,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("toml error: {0}")]
     Toml(#[from] toml::ser::Error),
     #[error("config error: {0}")]
     Config(String),
+    #[error("adapter error: {0}")]
+    Adapter(String),
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::system_adapter::fake::FakeSystemAdapter;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn enable_autostart_called_exactly_once_during_clean_setup() {
+        let _guard = test_lock().lock().expect("test mutex poisoned");
+
+        let temp = tempdir().expect("failed to create temp dir");
+        // SAFETY: tests are serialized via global mutex, so process-wide env mutation is controlled.
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+        }
+
+        let adapter = FakeSystemAdapter::new(true, true);
+        let _ = run_setup(&adapter);
+
+        let calls = adapter.calls();
+        let count = calls.iter().filter(|c| *c == "enable_autostart").count();
+        assert_eq!(count, 1, "enable_autostart should be called exactly once");
+    }
 }
