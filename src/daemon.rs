@@ -1,6 +1,7 @@
 //! Unix socket daemon for processing requests and managing runtime state.
 
-use crate::config::{AppConfig, ConfigError};
+use crate::config::{AppConfig, ConfigError, PersistentState};
+use crate::modes::Profile;
 use crate::processor::TextProcessor;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug)]
 pub struct AppState {
     pub override_model: Option<String>,
+    pub active_profile: Profile,
     pub processor: TextProcessor,
 }
 
@@ -29,6 +31,10 @@ impl AppState {
     pub fn set_override_model(&mut self, model: String) {
         self.override_model = Some(model);
     }
+
+    pub fn set_active_profile(&mut self, profile: Profile) {
+        self.active_profile = profile;
+    }
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;
@@ -39,6 +45,9 @@ pub enum Request {
     Process {
         text: String,
         request_id: Option<String>,
+        /// Optional profile override for this request.  When absent, the
+        /// currently active profile stored in `AppState` is used.
+        profile: Option<Profile>,
     },
     SetModel {
         model: String,
@@ -60,6 +69,7 @@ pub enum Response {
     Status {
         model: String,
         version: String,
+        profile: String,
     },
     Error(String),
 }
@@ -79,11 +89,13 @@ impl Daemon {
         socket_path: PathBuf,
     ) -> Result<Self, DaemonError> {
         let processor = TextProcessor::new(config.clone())?;
+        let persistent = PersistentState::load();
 
         Ok(Self {
             socket_path,
             state: Arc::new(Mutex::new(AppState {
                 override_model: None,
+                active_profile: persistent.profile,
                 processor,
             })),
         })
@@ -155,10 +167,14 @@ pub async fn handle_connection(stream: UnixStream, state: SharedState) -> Result
 
 pub async fn handle_request(request: Request, state: SharedState) -> Response {
     match request {
-        Request::Process { text, request_id } => {
+        Request::Process {
+            text,
+            request_id,
+            profile,
+        } => {
             let request_id = request_id.unwrap_or_else(|| "unknown-request".to_owned());
             info!(request_id = %request_id, input_len = text.len(), "received process request");
-            let (processor, override_model) = {
+            let (processor, override_model, active_profile) = {
                 let guard = match state.lock() {
                     Ok(guard) => guard,
                     Err(_) => {
@@ -166,15 +182,38 @@ pub async fn handle_request(request: Request, state: SharedState) -> Response {
                         return Response::Error("failed to lock app state".to_owned());
                     }
                 };
-                (guard.processor.clone(), guard.override_model.clone())
+                (
+                    guard.processor.clone(),
+                    guard.override_model.clone(),
+                    guard.active_profile.clone(),
+                )
+            };
+
+            // If a profile was supplied in the request, it becomes the new active
+            // profile and is persisted so it survives daemon restarts.
+            let effective_profile = if let Some(p) = profile {
+                if p != active_profile {
+                    if let Ok(mut guard) = state.lock() {
+                        guard.set_active_profile(p.clone());
+                    }
+                    let persistent = PersistentState {
+                        profile: p.clone(),
+                    };
+                    if let Err(err) = persistent.save() {
+                        warn!(error = %err, "failed to persist active profile to state file");
+                    }
+                }
+                p
+            } else {
+                active_profile
             };
 
             let model_for_log = override_model
                 .as_deref()
                 .unwrap_or_else(|| processor.config_model());
-            debug!(request_id = %request_id, model = %model_for_log, "forwarding text to processor");
+            debug!(request_id = %request_id, model = %model_for_log, profile = %effective_profile, "forwarding text to processor");
             let processed = processor
-                .process(&text, &request_id, override_model.as_deref())
+                .process(&text, &request_id, override_model.as_deref(), &effective_profile)
                 .await;
             info!(request_id = %request_id, output_len = processed.len(), "process request completed");
             Response::Text(processed)
@@ -201,14 +240,15 @@ pub async fn handle_request(request: Request, state: SharedState) -> Response {
             }
         }
         Request::GetStatus => {
-            let model = match state.lock() {
-                Ok(guard) => guard.current_model(),
+            let (model, profile) = match state.lock() {
+                Ok(guard) => (guard.current_model(), guard.active_profile.name()),
                 Err(_) => return Response::Error("failed to lock app state".to_owned()),
             };
 
             Response::Status {
                 model,
                 version: VERSION.to_owned(),
+                profile,
             }
         }
     }

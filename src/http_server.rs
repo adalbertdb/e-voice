@@ -8,8 +8,9 @@
 //! | GET    | /health    | Returns `{"status":"ok"}` when the server is up  |
 //! | GET    | /status    | Returns active model name and daemon version     |
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, PersistentState};
 use crate::daemon::{AppState, SharedState, handle_request, Request, Response};
+use crate::modes::Profile;
 use crate::processor::TextProcessor;
 use axum::{
     Router,
@@ -33,6 +34,9 @@ pub const DEFAULT_HTTP_PORT: u16 = 39539;
 #[derive(Debug, Deserialize)]
 pub struct ProcessPayload {
     pub text: String,
+    /// Optional profile for this request.  Defaults to the currently active
+    /// profile stored in `AppState` (i.e. `UniversalInterpreter` on first run).
+    pub profile: Option<Profile>,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,6 +53,7 @@ pub struct HealthResponse {
 pub struct StatusResponse {
     pub model: String,
     pub version: String,
+    pub profile: String,
 }
 
 // ─── Route handlers ───────────────────────────────────────────────────────────
@@ -59,9 +64,19 @@ async fn health_handler() -> impl IntoResponse {
 
 async fn status_handler(State(state): State<SharedState>) -> impl IntoResponse {
     match handle_request(Request::GetStatus, state).await {
-        Response::Status { model, version } => {
-            (StatusCode::OK, Json(StatusResponse { model, version })).into_response()
-        }
+        Response::Status {
+            model,
+            version,
+            profile,
+        } => (
+            StatusCode::OK,
+            Json(StatusResponse {
+                model,
+                version,
+                profile,
+            }),
+        )
+            .into_response(),
         Response::Error(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "unexpected response").into_response(),
     }
@@ -75,6 +90,7 @@ async fn process_handler(
         Request::Process {
             text: payload.text,
             request_id: None,
+            profile: payload.profile,
         },
         state,
     )
@@ -99,10 +115,24 @@ pub fn create_router(state: SharedState) -> Router {
 }
 
 /// Initialise the shared application state from a config.
+///
+/// Starts with the default profile (`UniversalInterpreter`).  Production code
+/// should call [`build_state_with_persistent_profile`] (or use [`run`]) to
+/// restore the last active profile from the state file.
 pub fn build_state(config: AppConfig) -> Result<SharedState, crate::processor::ProcessorError> {
+    build_state_with_profile(config, Profile::default())
+}
+
+/// Initialise state with an explicit initial profile.  Used by [`run`] to
+/// restore the persisted profile on daemon start.
+fn build_state_with_profile(
+    config: AppConfig,
+    profile: Profile,
+) -> Result<SharedState, crate::processor::ProcessorError> {
     let processor = TextProcessor::new(config)?;
     Ok(Arc::new(Mutex::new(AppState {
         override_model: None,
+        active_profile: profile,
         processor,
     })))
 }
@@ -119,7 +149,8 @@ pub async fn run(
     port: u16,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = build_state(config)?;
+    let persistent = PersistentState::load();
+    let state = build_state_with_profile(config, persistent.profile)?;
     let app = create_router(state);
     let listener = bind_listener(port).await?;
     let local_addr = listener.local_addr()?;
@@ -356,6 +387,75 @@ mod tests {
         assert!(
             content.contains(&format!("http://127.0.0.1:{DEFAULT_HTTP_PORT}/process")),
             "voxtype config must reference the HTTP process endpoint; got:\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_process_without_profile_defaults_to_universal() {
+        // Missing profile field must use UniversalInterpreter (default).
+        let ollama_url = spawn_ollama_mock("processed").await;
+        let config = make_config(ollama_url);
+        let (port, _shutdown) = start_test_server(config).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/process"))
+            .json(&serde_json::json!({"text": "hello world"}))
+            .send()
+            .await
+            .expect("process request should succeed");
+
+        assert_eq!(resp.status(), 200, "should return 200 when profile is absent");
+        let body: serde_json::Value = resp.json().await.expect("body should be JSON");
+        assert!(
+            body["text"].as_str().is_some(),
+            "text field should be present in response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_process_with_profile_field() {
+        // Explicit profile field must be accepted and processed without error.
+        let ollama_url = spawn_ollama_mock("formal output").await;
+        let config = make_config(ollama_url);
+        let (port, _shutdown) = start_test_server(config).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/process"))
+            .json(&serde_json::json!({"text": "hey mate", "profile": "formal"}))
+            .send()
+            .await
+            .expect("process request with profile should succeed");
+
+        assert_eq!(resp.status(), 200, "should return 200 for formal profile");
+        let body: serde_json::Value = resp.json().await.expect("body should be JSON");
+        assert!(
+            body["text"].as_str().is_some(),
+            "text field should be present in response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_status_returns_active_profile() {
+        // GET /status must include the "profile" field.
+        let ollama_url = spawn_ollama_mock("ok").await;
+        let config = make_config(ollama_url);
+        let (port, _shutdown) = start_test_server(config).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/status"))
+            .send()
+            .await
+            .expect("status request should succeed");
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("body should be JSON");
+        let profile = body["profile"].as_str().expect("profile field must be present");
+        assert_eq!(
+            profile, "universal_interpreter",
+            "default active profile should be universal_interpreter"
         );
     }
 }

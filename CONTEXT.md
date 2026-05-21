@@ -10,38 +10,53 @@ prompt, and returns cleaned/reformatted text to the caller (e.g. voxtype).
 
 ### TextProcessor
 
-The core unit of work. Accepts raw transcription text, builds a prompt internally, and
-returns processed text from the configured Ollama model. The prompt strategy is an
-internal implementation detail — callers do not influence prompt construction.
+The core unit of work. Accepts raw transcription text and a `Profile`, builds a prompt
+internally via `Profile::prompt_for`, and returns processed text from the configured
+Ollama model. The prompt strategy is determined entirely by the active `Profile`.
 
-### Processor Prompt Strategy (internal)
+### Profile
 
-Currently hard-wired to `Mode::Clean`, a universal interpreter prompt that handles
-cleaning, formatting, translation, and tone changes based on trailing instructions in
-the transcription. This is not exposed in the public interface.
+`Profile` (`src/modes.rs`) is the named prompt strategy that controls how transcribed
+speech is rewritten.  It replaces the old `Mode::Clean` placeholder.
 
-### Profile (future)
+Built-in variants:
+- `UniversalInterpreter` — default; cleans speech and handles inline instructions
+- `Formal` — rewrites in professional tone
+- `Casual` — rewrites in relaxed, friendly tone
+- `Bullet` — formats as Markdown bullet points
+- `Translate(lang)` — translates to the given language code (e.g. `"es"`, `"fr"`)
 
-`Profile` will replace the current `Mode` enum as a named prompt strategy tied to social
-context (e.g. "work", "casual", "technical"). A Profile bundles a prompt template, tone
-preferences, and optional post-processing rules. Profiles will be user-configurable and
-selectable at runtime without changes to the daemon protocol.
+`Profile::prompt_for(text: &str) -> String` builds the full LLM prompt by substituting
+the input text into the profile's instruction template.
 
-`Mode` in `src/modes.rs` is the current private placeholder that will evolve into the
-Profile system. Nothing outside `src/processor.rs` should import `Mode`.
+Profiles serialise to a compact string (`"universal_interpreter"`, `"formal"`,
+`"translate:es"`, etc.) for HTTP payloads and TOML state files.
+
+### Profile Persistence
+
+The active profile is stored in `AppState` and persisted to `state.toml` (alongside
+`config.toml` in the e-voice config directory) whenever it changes.  On daemon restart
+the last active profile is restored via `PersistentState::load()`.
+
+Custom profiles are not yet implemented; they are planned for a future issue.
 
 ### Daemon Protocol
 
 Newline-delimited JSON over a Unix socket. Requests and responses are tagged enums
 (`Request`, `Response` in `src/daemon.rs`).
 
-`Response::Status` reports `{ model, version }` — the active model and daemon version.
-Mode/profile information is intentionally absent from the status response until the
-Profile system is ready.
+`Response::Status` reports `{ model, version, profile }` — the active model, daemon
+version, and active profile name.
+
+`Request::Process` accepts an optional `profile` field.  When present the supplied
+profile is used for that request **and** becomes the new active profile (persisted to
+`state.toml`).  When absent the current `AppState.active_profile` is used.
 
 ### AppState
 
-Holds `override_model` (runtime model override) and `processor`. No mode state.
+Holds `override_model` (runtime model override), `active_profile` (current `Profile`),
+and `processor`.  The active profile defaults to `UniversalInterpreter` on a fresh start
+and is restored from `state.toml` on subsequent starts.
 
 ### e-voice status
 

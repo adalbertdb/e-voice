@@ -96,7 +96,11 @@ mod tests {
             .await
             .expect("GetStatus should succeed");
         match status {
-            Response::Status { model, version } => {
+            Response::Status {
+                model,
+                version,
+                profile: _,
+            } => {
                 assert!(!model.is_empty(), "model should not be empty");
                 assert!(!version.is_empty(), "version should not be empty");
             }
@@ -119,7 +123,11 @@ mod tests {
             .await
             .expect("GetStatus after SetModel should succeed");
         match status_after {
-            Response::Status { model, version } => {
+            Response::Status {
+                model,
+                version,
+                profile: _,
+            } => {
                 assert_eq!(model, "llama3.2:3b");
                 assert!(!version.is_empty(), "version should not be empty");
             }

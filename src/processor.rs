@@ -4,7 +4,7 @@
 
 use crate::config::AppConfig;
 use crate::llm_backend::{BackendError, LlmBackend, from_config};
-use crate::modes::Mode;
+use crate::modes::Profile;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -72,9 +72,10 @@ impl TextProcessor {
         raw_text: &str,
         request_id: &str,
         override_model: Option<&str>,
+        profile: &Profile,
     ) -> String {
         match self
-            .process_inner(raw_text, request_id, override_model)
+            .process_inner(raw_text, request_id, override_model, profile)
             .await
         {
             Ok(output) if !output.trim().is_empty() => output,
@@ -99,9 +100,10 @@ impl TextProcessor {
         raw_text: &str,
         request_id: &str,
         override_model: Option<&str>,
+        profile: &Profile,
     ) -> Result<String, ProcessorError> {
         let model = override_model.unwrap_or(&self.default_model);
-        let prompt = Mode::Clean.prompt_template(raw_text);
+        let prompt = profile.prompt_for(raw_text);
 
         info!(
             request_id = %request_id,
@@ -163,7 +165,9 @@ mod tests {
             response: Ok("processed output".to_owned()),
         };
         let processor = TextProcessor::with_backend(backend, "test-model", 300);
-        let result = processor.process("raw input", "req-1", None).await;
+        let result = processor
+            .process("raw input", "req-1", None, &Profile::default())
+            .await;
         assert_eq!(result, "processed output");
     }
 
@@ -174,7 +178,9 @@ mod tests {
         };
         let processor = TextProcessor::with_backend(backend, "test-model", 300);
         let raw = "raw input text";
-        let result = processor.process(raw, "req-2", None).await;
+        let result = processor
+            .process(raw, "req-2", None, &Profile::default())
+            .await;
         // Backend error → fallback to raw input.
         assert_eq!(result, raw);
     }
@@ -216,7 +222,7 @@ mod tests {
         };
         let processor = TextProcessor::with_backend(backend, "default-model", 300);
         let result = processor
-            .process("raw input", "req-3", Some("override-model"))
+            .process("raw input", "req-3", Some("override-model"), &Profile::default())
             .await;
         assert_eq!(result, "output");
         assert_eq!(*captured.lock().await, "override-model");

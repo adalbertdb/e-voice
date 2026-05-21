@@ -115,6 +115,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .send(Request::Process {
                     text: text.clone(),
                     request_id: Some(request_id.clone()),
+                    profile: None,
                 })
                 .await
             {
