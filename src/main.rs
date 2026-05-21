@@ -1,9 +1,9 @@
 //! Binary entrypoint for the e-voice daemon and client commands.
 
 use clap::{Parser, Subcommand};
-use client::DaemonClient;
 use config::AppConfig;
 use daemon::{Daemon, Request, Response, socket_path};
+use transport::DaemonTransport;
 use reqwest::StatusCode;
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -14,13 +14,13 @@ use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod client;
 mod config;
 mod daemon;
 mod modes;
 mod processor;
 mod setup;
 mod tray;
+mod transport;
 
 static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -96,7 +96,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             let request_id = next_request_id();
             info!(request_id = %request_id, input_len = text.len(), "starting process command");
 
-            let client = DaemonClient::new();
+            let client = DaemonTransport::new(
+                socket_path().map_err(|e| format!("failed to resolve socket path: {e}"))?,
+            );
             match client
                 .send(Request::Process {
                     text: text.clone(),
@@ -199,7 +201,9 @@ fn next_request_id() -> String {
 }
 
 async fn print_status(as_json: bool, follow: bool) -> Result<(), String> {
-    let client = DaemonClient::new();
+    let client = DaemonTransport::new(
+        socket_path().map_err(|e| format!("failed to resolve socket path: {e}"))?,
+    );
     let mut last_mode: Option<String> = None;
 
     loop {
@@ -276,7 +280,7 @@ async fn run_doctor() -> Result<(), String> {
         println!("[fail] daemon socket missing: {}", sock.display());
     }
 
-    let client = DaemonClient::new();
+    let client = DaemonTransport::new(sock);
     match client.send(Request::GetStatus).await {
         Ok(Response::Status { mode, version, .. }) => {
             println!("[ok] daemon reachable: mode={mode} version={version}");

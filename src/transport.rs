@@ -1,38 +1,31 @@
-//! Unix socket client helpers used by CLI commands.
+//! Unified Unix socket transport used by both CLI commands and the system tray.
 
-use crate::daemon::{Request, Response, socket_path};
+use crate::daemon::{Request, Response};
 use std::path::PathBuf;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+/// Low-level transport that speaks the daemon's newline-delimited JSON protocol.
+///
+/// The caller is responsible for resolving the socket path before constructing
+/// this type — no path resolution happens internally.
 #[derive(Debug, Clone)]
-pub struct DaemonClient {
-    socket_path: Option<PathBuf>,
+pub struct DaemonTransport {
+    socket_path: PathBuf,
 }
 
-impl DaemonClient {
-    pub fn new() -> Self {
-        Self { socket_path: None }
+impl DaemonTransport {
+    pub fn new(socket_path: PathBuf) -> Self {
+        Self { socket_path }
     }
 
-    #[cfg(test)]
-    pub fn with_socket_path(path: PathBuf) -> Self {
-        Self {
-            socket_path: Some(path),
-        }
-    }
-
-    pub async fn send(&self, request: Request) -> Result<Response, ClientError> {
-        let path = match &self.socket_path {
-            Some(path) => path.clone(),
-            None => socket_path()?,
-        };
-        let stream = UnixStream::connect(path).await?;
+    pub async fn send(&self, req: Request) -> Result<Response, DaemonTransportError> {
+        let stream = UnixStream::connect(&self.socket_path).await?;
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
-        let payload = serde_json::to_string(&request)?;
+        let payload = serde_json::to_string(&req)?;
         writer.write_all(payload.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -40,7 +33,7 @@ impl DaemonClient {
         let line = lines
             .next_line()
             .await?
-            .ok_or_else(|| ClientError::Protocol("daemon closed connection".to_owned()))?;
+            .ok_or_else(|| DaemonTransportError::Protocol("daemon closed connection".to_owned()))?;
 
         let response = serde_json::from_str::<Response>(&line)?;
         Ok(response)
@@ -48,15 +41,13 @@ impl DaemonClient {
 }
 
 #[derive(Debug, Error)]
-pub enum ClientError {
+pub enum DaemonTransportError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("protocol error: {0}")]
     Protocol(String),
-    #[error("daemon error: {0}")]
-    Daemon(#[from] crate::daemon::DaemonError),
 }
 
 #[cfg(test)]
@@ -74,7 +65,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_client_get_status_and_set_mode_roundtrip() {
+    async fn daemon_transport_get_status_and_set_model_roundtrip() {
         let _guard = test_lock().lock().expect("test mutex poisoned");
 
         let temp = tempfile::tempdir().expect("failed to create temp dir");
@@ -98,9 +89,9 @@ mod tests {
         }
         assert!(socket_path.exists(), "socket file was not created");
 
-        let client = DaemonClient::with_socket_path(socket_path.clone());
+        let transport = DaemonTransport::new(socket_path.clone());
 
-        let status = client
+        let status = transport
             .send(Request::GetStatus)
             .await
             .expect("GetStatus should succeed");
@@ -111,7 +102,7 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        let changed = client
+        let changed = transport
             .send(Request::SetModel {
                 model: "llama3.2:3b".to_owned(),
             })
@@ -122,7 +113,7 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        let status_after = client
+        let status_after = transport
             .send(Request::GetStatus)
             .await
             .expect("GetStatus after SetModel should succeed");

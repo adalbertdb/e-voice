@@ -2,6 +2,7 @@
 
 use crate::config::{AppConfig, config_file_path};
 use crate::daemon::{Daemon, Request, Response, socket_path};
+use crate::transport::{DaemonTransport, DaemonTransportError};
 use ksni::TrayMethods;
 use std::process::Command;
 use std::time::Duration;
@@ -303,22 +304,32 @@ pub async fn run() -> Result<(), TrayError> {
                         }
                     }
                     Some(TrayCmd::SetOllamaModel(model)) => {
-                        match send_daemon_request(Request::SetModel { model: model.clone() }).await {
-                            Ok(Response::ModelChanged { .. }) => {
-                                info!(model = %model, "ollama model changed");
-                                tray_handle.update(|tray: &mut TrayState| {
-                                    tray.ollama_model = model.clone();
-                                }).await;
-                                send_notification(
-                                    "Ollama Model",
-                                    &format!("Switched to {}", model),
-                                );
-                            }
-                            Ok(other) => {
-                                warn!(response = ?other, "unexpected daemon response to SetModel");
+                        let transport_result = socket_path()
+                            .map_err(|e| TrayError::Daemon(e.to_string()))
+                            .map(DaemonTransport::new);
+                        match transport_result {
+                            Ok(transport) => {
+                                match transport.send(Request::SetModel { model: model.clone() }).await {
+                                    Ok(Response::ModelChanged { .. }) => {
+                                        info!(model = %model, "ollama model changed");
+                                        tray_handle.update(|tray: &mut TrayState| {
+                                            tray.ollama_model = model.clone();
+                                        }).await;
+                                        send_notification(
+                                            "Ollama Model",
+                                            &format!("Switched to {}", model),
+                                        );
+                                    }
+                                    Ok(other) => {
+                                        warn!(response = ?other, "unexpected daemon response to SetModel");
+                                    }
+                                    Err(err) => {
+                                        error!(%err, "failed to set ollama model via daemon");
+                                    }
+                                }
                             }
                             Err(err) => {
-                                error!(%err, "failed to set ollama model via daemon");
+                                error!(%err, "failed to resolve daemon socket path");
                             }
                         }
                     }
@@ -361,28 +372,6 @@ pub async fn run() -> Result<(), TrayError> {
     }
 
     Ok(())
-}
-
-async fn send_daemon_request(request: Request) -> Result<Response, TrayError> {
-    let sock_path = socket_path()?;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-
-    let stream = UnixStream::connect(&sock_path).await?;
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-
-    let payload = serde_json::to_string(&request)?;
-    writer.write_all(payload.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-
-    let line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| TrayError::Daemon("daemon closed connection".into()))?;
-
-    Ok(serde_json::from_str(&line)?)
 }
 
 fn read_voxtype_stt_config() -> (String, String, String) {
@@ -563,4 +552,6 @@ pub enum TrayError {
     Socket(#[from] crate::daemon::DaemonError),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("transport error: {0}")]
+    Transport(#[from] DaemonTransportError),
 }
