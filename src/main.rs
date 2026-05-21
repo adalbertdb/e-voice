@@ -17,6 +17,7 @@ mod config;
 mod daemon;
 mod diagnostics;
 mod http_server;
+mod llm_backend;
 mod modes;
 mod processor;
 mod setup;

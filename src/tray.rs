@@ -239,8 +239,8 @@ pub(crate) async fn apply_stt_language_cmd<A: SystemAdapter>(
 
 pub async fn run<A: SystemAdapter + Send + Sync>(adapter: &A) -> Result<(), TrayError> {
     let config = AppConfig::load().map_err(|e| TrayError::Config(e.to_string()))?;
-    let ollama_url = config.ollama.url.clone();
-    let default_model = config.ollama.model.clone();
+    let ollama_url = config.llm.url.clone();
+    let default_model = config.llm.model.clone();
 
     let daemon = Daemon::new(config).map_err(|e| TrayError::Daemon(e.to_string()))?;
 

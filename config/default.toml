@@ -1,3 +1,5 @@
-[ollama]
+[llm]
+backend = "ollama"
 url = "http://localhost:11434"
 model = "llama3.2:1b"
+keep_alive_secs = 300
