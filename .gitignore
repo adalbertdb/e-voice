@@ -4,3 +4,12 @@ state.toml
 openspec/
 .atl
 # Keep Cargo.lock for binaries/applications; omit for libraries if desired
+
+# Node / frontend
+node_modules/
+src-frontend/node_modules/
+src-frontend/dist/
+
+# Tauri build artifacts
+src-tauri/target/
+src-tauri/WixTools/
